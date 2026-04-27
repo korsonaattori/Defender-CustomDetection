@@ -443,5 +443,195 @@
       <Condition>Time-based exclusions for maintenance</Condition>
       <Condition>Review for penetration test activities</Condition>
     </FalsePositiveReduction>
+
+  <DetectionRule ID="CUSTOM-RANS-006" Version="1.0" Status="Active">
+    <Name>Data Staging Archive Creation Pre-Encryption</Name>
+    <Description>Detects bulk file staging operations that precede ransomware encryption, including large-scale file copying, archiving, and compression activities targeting sensitive data repositories. This behavior is characteristic of double/triple extortion ransomware operations that exfiltrate data before encryption to increase pressure on victims.</Description>
+    <Severity>Critical</Severity>
+    <Tactics>Collection, Impact</Tactics>
+    <Techniques>T1560.001, T1486</Techniques>
+    <ConfidenceLevel>High (94%)</ConfidenceLevel>
+    <FidelityScore>95%</FidelityScore>
+    <MITREMapping>T1560.001 - Archive Collected Data, T1486 - Data Encrypted for Impact</MITREMapping>
+    <ThreatActors>BlackCat, LockBit, Conti, Royal, BianLian</ThreatActors>
+    
+    <DetectionLogic>
+      <![CDATA[
+      let SensitiveFolders = dynamic([
+        "Financial", "Finance", "HR", "Human Resources", "Payroll",
+        "Legal", "Contracts", "IP", "Trade Secrets", "R&D",
+        "Executive", "Board", "Confidential", "Customer", "Client"
+      ]);
+      
+      let ArchiveTools = dynamic([
+        "7z.exe", "7za.exe", "rar.exe", "WinRAR", "Bandizip",
+        "PeaZip", "IZArc", "Hamster", "FreeArc", "ZPAQ",
+        "Compress-Archive", "tar", "gzip", "7z", "WinZip"
+      ]);
+      
+      let MassCopyIndicators = dynamic([
+        "xcopy /s", "robocopy", "copy /b", "xcopy", 
+        "robocopy.*\\/MIR", "robocopy.*\\/E", "xcopy.*\\/S"
+      ]);
+      
+      // Detect rapid archive creation in sensitive locations
+      DeviceProcessEvents
+      | where Timestamp > ago(2h)
+      | where InitiatingProcessFileName has_any (ArchiveTools)
+        or ProcessCommandLine has_any (ArchiveTools)
+      | where FolderPath has_any (SensitiveFolders)
+        or ProcessCommandLine has_any (SensitiveFolders)
+      | extend ArchiveOperation = case(
+          ProcessCommandLine has "7z", "7-Zip Archive",
+          ProcessCommandLine has "rar", "RAR Archive",
+          ProcessCommandLine has "Compress-Archive", "PowerShell Compress",
+          ProcessCommandLine has "tar", "TAR Archive",
+          "Generic Archive"
+        )
+      | summarize 
+          ArchiveCount = count(),
+          TotalSizeMB = sum(tolong(ProcessCommandLine)),
+          SensitiveTargets = make_set(FolderPath, 10),
+          ArchivesCreated = make_set(FileName, 10)
+        by bin(Timestamp, 10m), DeviceName, UserName, ArchiveOperation
+      | where ArchiveCount >= 5
+      
+      union
+      
+      // Detect mass file copying to staging locations
+      DeviceFileEvents
+      | where Timestamp > ago(2h)
+      | where ActionType in ("FileCreated", "FileRenamed")
+        and FileSize > 10485760  // 10MB files
+      | where FolderPath has_any (SensitiveFolders)
+        or FileName has_any ("classified", "confidential", "secret", "proprietary")
+      | where not(InitiatingProcessFileName in~ (
+          "explorer.exe", "OneDrive.exe", "Teams.exe",
+          "Outlook.exe", "svchost.exe"
+        ))
+      | summarize 
+          FileCount = count(),
+          TotalSize = sum(FileSize),
+          UniqueFiles = dcount(FileName)
+        by bin(Timestamp, 10m), DeviceName, UserName, FolderPath
+      | where FileCount >= 50
+      | extend StagingIndicator = case(
+          TotalSize > 1073741824, "Large Staging (>1GB)",
+          FileCount > 100, "Mass File Collection",
+          "Suspicious File Activity"
+        )
+      ]]>
+    </DetectionLogic>
+    
+    <QueryFrequency>PT2H</QueryFrequency>
+    <QueryPeriod>PT2H</QueryPeriod>
+    <TriggerThreshold>1</TriggerThreshold>
+    <TriggerOperator>GreaterThan</TriggerOperator>
+    <SuppressionDuration>PT30M</SuppressionDuration>
+    
+    <AlertSeverity>Critical</AlertSeverity>
+    <AlertTitle>Data Staging Detected - Likely Double/Triple Extortion Ransomware Activity</AlertTitle>
+    <AlertDescription>Detected bulk data staging and archiving operations on {DeviceName}, consistent with ransomware data exfiltration prior to encryption. This indicates imminent double/triple extortion ransomware attack.</AlertDescription>
+    
+    <RemediationSteps>
+      <Step Order="1">IMMEDIATE: Isolate affected device from network</Step>
+      <Step Order="2">IMMEDIATE: Preserve all staging locations as evidence</Step>
+      <Step Order="3">Identify all data accessed and potential exfiltration</Step>
+      <Step Order="4">Notify cyber insurance and law enforcement immediately</Step>
+      <Step Order="5">Begin incident response for double extortion scenario</Step>
+      <Step Order="6">Prepare for potential data breach notifications</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude authorized backup operations during maintenance windows</Condition>
+      <Condition>Exclude known data migration projects with proper documentation</Condition>
+      <Condition>IT administrative activities during approved change windows</Condition>
+    </FalsePositiveReduction>
+  </DetectionRule>
+  
+  <DetectionRule ID="CUSTOM-RANS-007" Version="1.0" Status="Active">
+    <Name>Volume Shadow Copy Enumeration via WMI</Name>
+    <Description>Detects enumeration and deletion attempts of Volume Shadow Copies using Windows Management Instrumentation (WMI). Ransomware groups use WMI to identify and delete shadow copies to prevent data recovery, often using tools like vssadmin, wmic, or PowerShell WMI calls to execute "shadow copy deletion" commands remotely.</Description>
+    <Severity> Critical</Severity>
+    <Tactics>Impact</Tactics>
+    <Techniques>T1490</Techniques>
+    <ConfidenceLevel>Critical (98%)</ConfidenceLevel>
+    <FidelityScore>97%</FidelityScore>
+    <MITREMapping>T1490 - Inhibit System Recovery</MITREMapping>
+    <ThreatActors>LockBit, BlackCat, Conti, REvil, DarkSide</ThreatActors>
+    
+    <DetectionLogic>
+      <![CDATA[
+      let ShadowCopyKeywords = dynamic([
+        "shadowcopy", "shadow copy", "vssadmin", "win32_shadowcopy",
+        "\\\\.\\root\\cimv2", "Win32_ShadowCopy", "Delete", "Remove"
+      ]);
+      
+      let DeletionCommands = dynamic([
+        "delete", "remove", "resize", "revert", "discard"
+      ]);
+      
+      // Detect WMI-based shadow copy enumeration and deletion
+      DeviceProcessEvents
+      | where Timestamp > ago(1h)
+      | where InitiatingProcessFileName in~ ("wmic.exe", "powershell.exe", "pwsh.exe", "cmd.exe")
+        or ProcessCommandLine has_any (ShadowCopyKeywords)
+      | where ProcessCommandLine has_any (DeletionCommands)
+        or ProcessCommandLine matches regex @"(?i)(shadow.*copy).*(delete|remove|resize)"
+        or ProcessCommandLine matches regex @"Win32_ShadowCopy.*(Delete|Remove)"
+      | extend ShadowCopyActivity = case(
+          ProcessCommandLine has "vssadmin delete", "VSSAdmin Direct Deletion",
+          ProcessCommandLine has "Win32_ShadowCopy", "WMI ShadowCopy Deletion",
+          ProcessCommandLine has "wmic.*shadow", "WMIC Shadow Manipulation",
+          "Shadow Copy Enumeration"
+        )
+      | summarize 
+          EventCount = count(),
+          CommandLines = make_set(ProcessCommandLine, 5),
+          Tools = make_set(InitiatingProcessFileName, 5)
+        by bin(Timestamp, 5m), DeviceName, ShadowCopyActivity, UserName
+      | where EventCount >= 2
+      
+      union
+      
+      // Detect PowerShell WMI shadow copy manipulation
+      DeviceEvents
+      | where Timestamp > ago(1h)
+      | where ActionType == "PowershellNSEScript"
+        and AdditionalFields has_any ("Win32_ShadowCopy", "WMI", "Delete")
+      | extend ScriptContent = tostring(AdditionalFields.ScriptContent)
+      | where ScriptContent matches regex @"(?i)(Get-WmiObject|Get-CimInstance).*(Win32_ShadowCopy)"
+      | summarize 
+          EventCount = count(),
+          Scripts = make_set(ScriptContent, 3)
+        by bin(Timestamp, 5m), DeviceName, UserName
+      | where EventCount >= 1
+      ]]>
+    </DetectionLogic>
+    
+    <QueryFrequency>PT1H</QueryFrequency>
+    <QueryPeriod>PT1H</QueryPeriod>
+    <TriggerThreshold>1</TriggerThreshold>
+    <TriggerOperator>GreaterThan</TriggerOperator>
+    <SuppressionDuration>PT1H</SuppressionDuration>
+    
+    <AlertSeverity>Critical</AlertSeverity>
+    <AlertTitle>Volume Shadow Copy Enumeration/Deletion Detected - Ransomware Prevention Evasion</AlertTitle>
+    <AlertDescription>Detected Volume Shadow Copy enumeration and/or deletion attempts via WMI on {DeviceName}. This is a critical ransomware indicator as attackers disable recovery mechanisms before encryption.</AlertDescription>
+    
+    <RemediationSteps>
+      <Step Order="1">IMMEDIATE: Isolate affected device</Step>
+      <Step Order="2">Check for shadow copy deletion (vssadmin list shadows)</Step>
+      <Step Order="3">Attempt shadow copy recovery if available</Step>
+      <Step Order="4">Verify backup integrity and availability</Step>
+      <Step Order="5">Enable Volume Shadow Copy on all critical systems</Step>
+      <Step Order="6">Implement WMI event filtering for shadow copy operations</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude authorized backup software operations</Condition>
+      <Condition>Exclude IT administrative shadow copy management</Condition>
+      <Condition>Documented system maintenance procedures</Condition>
+    </FalsePositiveReduction>
   </DetectionRule>
 </DetectionRules>

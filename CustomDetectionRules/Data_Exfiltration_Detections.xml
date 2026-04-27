@@ -474,5 +474,222 @@
       <Condition>Time-based: Focus on unusual patterns outside business hours</Condition>
       <Condition>Size-based: Require minimum archive size threshold</Condition>
     </FalsePositiveReduction>
+
+  <DetectionRule ID="CUSTOM-EXFIL-005" Version="1.0" Status="Active">
+    <Name>DNS Tunneling Domain Generation Algorithm (DGA)</Name>
+    <Description>Detects DNS tunneling and data exfiltration via Domain Generation Algorithms that encode sensitive data within DNS query patterns. Attackers use DNS as a covert channel to exfiltrate stolen data, bypass traditional security controls, and maintain command-and-control communications by generating pseudo-random domain names that encode payload data in subdomains and query types.</Description>
+    <Severity>Critical</Severity>
+    <Tactics>Exfiltration, Command and Control</Tactics>
+    <Techniques>T1048.003, T1568.002</Techniques>
+    <ConfidenceLevel>High (92%)</ConfidenceLevel>
+    <FidelityScore>94%</FidelityScore>
+    <MITREMapping>T1048.003 - Exfiltration Over Alternative Protocol: DNS, T1568.002 - Dynamic Resolution: Domain Generation Algorithms</MITREMapping>
+    <ThreatActors>APT29, APT28, Chinese State Actors, Ransomware Groups</ThreatActors>
+    
+    <DetectionLogic>
+      <![CDATA[
+      // Detect DNS tunneling patterns
+      DnsEvents
+      | where Timestamp > ago(1h)
+      | where SubType == "LookupQuery" 
+        and QueryType in ("A", "AAAA", "TXT", "CNAME", "MX")
+      | extend QueryLength = strlen(QueryName)
+      | extend SubdomainCount = countof(QueryName, "\\.")
+      | extend QueryEntropy = entropy(QueryName)
+      | where QueryLength > 50  // Suspiciously long queries
+        or SubdomainCount > 5   // Excessive subdomains
+        or QueryEntropy > 3.5   // High randomness (encoded data)
+      | where not(QueryName has_any (  // Exclude legitimate CDNs
+          "cloudfront.net", "azureedge.net", "akamai.net",
+          "googleapis.com", "microsoft.com", "office.com"
+        ))
+      | extend SuspectedDQAType = case(
+          QueryType == "TXT" and QueryLength > 100, "Data Exfiltration via TXT",
+          SubdomainCount > 8, "DGA Pattern Detected",
+          QueryEntropy > 4.0, "High Entropy Encoded Data",
+          "Suspicious DNS Query"
+        )
+      | summarize 
+          QueryCount = count(),
+          AvgQueryLength = avg(QueryLength),
+          MaxEntropy = max(QueryEntropy),
+          UniqueDomains = dcount(QueryName),
+          QueryTypes = make_set(QueryType, 5)
+        by bin(Timestamp, 10m), DeviceName, UserName, SuspectedDQAType
+      | where QueryCount >= 10
+      
+      union
+      
+      // Detect high-frequency DNS lookups for encoded data
+      DeviceNetworkEvents
+      | where Timestamp > ago(1h)
+      | where ActionType == "DnsQuery"
+        and RemoteDnsRecord contains "?"  // Query parameters in DNS (suspicious)
+        or RemoteDnsRecord matches regex @"[a-zA-Z0-9+/]{20,}\.[a-z]+"  // Base64-like patterns
+      | extend EncodedPattern = case(
+          RemoteDnsRecord matches regex @"[A-Za-z0-9+/]{40,}", "Base64 Encoded",
+          RemoteDnsRecord matches regex @"[0-9a-f]{32,}", "Hex Encoded",
+          "Suspected Encoding"
+        )
+      | summarize 
+          DnsQueryCount = count(),
+          EncodedQueries = make_set(RemoteDnsRecord, 10),
+          MaxLength = max(strlen(RemoteDnsRecord))
+        by bin(Timestamp, 10m), DeviceName, EncodedPattern
+      | where DnsQueryCount >= 20
+      ]]>
+    </DetectionLogic>
+    
+    <QueryFrequency>PT1H</QueryFrequency>
+    <QueryPeriod>PT1H</QueryPeriod>
+    <TriggerThreshold>1</TriggerThreshold>
+    <TriggerOperator>GreaterThan</TriggerOperator>
+    <SuppressionDuration>PT30M</SuppressionDuration>
+    
+    <AlertSeverity>High</AlertSeverity>
+    <AlertTitle>DNS Tunneling and DGA Activity Detected - Data Exfiltration Risk</AlertTitle>
+    <AlertDescription>Detected DNS tunneling and domain generation algorithm patterns from {DeviceName}. This indicates covert data exfiltration using DNS as a communication channel, bypassing traditional security controls.</AlertDescription>
+    
+    <RemediationSteps>
+      <Step Order="1">IMMEDIATE: Block suspicious DNS domains at firewall/DNS sinkhole</Step>
+      <Step Order="2">Isolate affected device from network</Step>
+      <Step Order="3">Review DNS logs for data exfiltration attempts</Step>
+      <Step Order="4">Implement DNS filtering and query length restrictions</Step>
+      <Step Order="5">Enable DNS security logging and monitoring</Step>
+      <Step Order="6">Review what data may have been exfiltrated</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude CDN and legitimate cloud service domains</Condition>
+      <Condition>Exclude known backup and DNS-over-HTTPS services</Condition>
+      <Condition>Time-based: Focus on off-hours activity</Condition>
+    </FalsePositiveReduction>
+
+  <DetectionRule ID="CUSTOM-EXFIL-006" Version="1.0" Status="Active">
+    <Name>Suspicious CI/CD Pipeline and Repository Activity</Name>
+    <Description>Detects indicators of CI/CD pipeline compromise including unusual code repository access patterns, automated build process manipulation, deployment credential theft, and supply chain attack behaviors targeting software development and deployment infrastructure.</Description>
+    <Severity>Critical</Severity>
+    <Tactics>Initial Access, Impact, Collection</Tactics>
+    <Techniques>T1195.001, T1195.003, T1552.001, T1486</Technicates>
+    <ConfidenceLevel>High (91%)</ConfidenceLevel>
+    <FidelityScore>93%</FidelityScore>
+    <MITREMapping>T1195.001 - Compromise Build System, T1195.003 - Compromise CI/CD Pipeline</MITREMapping>
+    <ThreatActors>APT29, APT28, Lazarus, SolarWinds-style Attackers, Dependency Confusion</ThreatActors>
+    
+    <DetectionLogic>
+      <![CDATA[
+      let GitCommands = dynamic([
+        "git clone", "git pull", "git push", "git fetch",
+        "git stash", "git checkout", "git branch", "git tag"
+      ]);
+      
+      let CICDTools = dynamic([
+        "Jenkins", "GitLab", "GitHub Actions", "Azure DevOps",
+        "TeamCity", "CircleCI", "Travis CI", "Buildkite",
+        "azure-pipelines", ".github/workflows", ".gitlab-ci"
+      ]);
+      
+      let SecretFiles = dynamic([
+        ".env", ".pem", ".key", ".crt", ".p12",
+        "id_rsa", "id_ed25519", "service-account",
+        "PersonalAccessToken", "oauth_token", "api_key"
+      ]);
+      
+      // Detect unusual git operations at scale
+      DeviceProcessEvents
+      | where Timestamp > ago(2h)
+      | where InitiatingProcessFileName endswith "git.exe"
+        or ProcessCommandLine has "git "
+      | where ProcessCommandLine has_any (GitCommands)
+        and ProcessCommandLine matches regex @"clone.*https://.*@.*|push.*https://.*@.*"
+      | extend GitOperation = case(
+          ProcessCommandLine has "clone", "Repository Clone",
+          ProcessCommandLine has "push", "Code Push",
+          ProcessCommandLine has "fetch", "Remote Fetch",
+          "Git Operation"
+        )
+      | summarize 
+          GitEventCount = count(),
+          Repositories = make_set(ProcessCommandLine, 10),
+          Operations = make_set(GitOperation, 5)
+        by bin(Timestamp, 15m), DeviceName, UserName
+      | where GitEventCount >= 20
+      
+      union
+      
+      // Detect CI/CD configuration file access and modification
+      DeviceFileEvents
+      | where Timestamp > ago(2h)
+      | where ActionType in ("FileCreated", "FileModified")
+        and (FolderPath has "\\.github\\workflows" 
+             or FolderPath has "\\.gitlab-ci" 
+             or FolderPath has "azure-pipelines"
+             or FileName in ("Jenkinsfile", ".travis.yml", "appveyor.yml"))
+        and not(InitiatingProcessFileName in~ (
+            "git.exe", "code.exe", "vscode.exe", "vim.exe"
+        ))
+      | extend ConfigType = case(
+          FileName endswith "workflows", "GitHub Actions",
+          FileName endswith "gitlab-ci", "GitLab CI",
+          FileName == "Jenkinsfile", "Jenkins Pipeline",
+          "CI/CD Configuration"
+        )
+      | summarize 
+          ConfigChanges = count(),
+          ModifiedFiles = make_set(FileName, 10),
+          WorkflowChanges = make_set(FolderPath, 10)
+        by bin(Timestamp, 15m), DeviceName, UserName, ConfigType
+      | where ConfigChanges >= 3
+      
+      union
+      
+      // Detect pipeline token/secret extraction attempts
+      DeviceProcessEvents
+      | where Timestamp > ago(1h)
+      | where InitiatingProcessFileName endswith "powershell.exe"
+        or InitiatingProcessFileName endswith "pwsh.exe"
+      | where ProcessCommandLine has_any (CICDTools)
+        and (ProcessCommandLine has "token" or ProcessCommandLine has "secret" or ProcessCommandLine has "credential")
+        or ProcessCommandLine matches regex @"(?i)(PAT|token|key|secret).*(env|variable|pipeline)"
+      | extend SecretExtraction = case(
+          ProcessCommandLine has "PersonalAccessToken", "PAT Extraction",
+          ProcessCommandLine has "oauth_token", "OAuth Token Extraction",
+          ProcessCommandLine has "api_key", "API Key Extraction",
+          "Pipeline Secret Access"
+        )
+      | summarize 
+          ExtractionCount = count(),
+          ToolsAccessed = make_set(InitiatingProcessFileName, 5),
+          SecretsTargeted = make_set(ProcessCommandLine, 5)
+        by bin(Timestamp, 10m), DeviceName, UserName, SecretExtraction
+      | where ExtractionCount >= 2
+      ]]>
+    </DetectionLogic>
+    
+    <QueryFrequency>PT2H</QueryFrequency>
+    <QueryPeriod>PT2H</QueryPeriod>
+    <TriggerThreshold>1</TriggerThreshold>
+    <TriggerOperator>GreaterThan</TriggerOperator>
+    <SuppressionDuration>PT1H</SuppressionDuration>
+    
+    <AlertSeverity> Critical</AlertSeverity>
+    <AlertTitle>CI/CD Pipeline Compromise Indicators Detected - Supply Chain Attack Risk</AlertTitle>
+    <AlertDescription>Detected suspicious CI/CD pipeline and repository activity on {DeviceName}, indicating potential supply chain attack or build system compromise. This could lead to malicious code injection and widespread deployment.</AlertDescription>
+    
+    <RemediationSteps>
+      <Step Order="1">IMMEDIATE: Freeze all CI/CD pipelines and deployments</Step>
+      <Step Order="2">IMMEDIATE: Rotate all pipeline tokens, API keys, and deployment credentials</Step>
+      <Step Order="3">Audit all recent commits and deployments for malicious code</Step>
+      <Step Order="4">Review third-party dependencies for supply chain compromise</Step>
+      <Step Order="5">Revoke and reissue all repository access tokens</Step>
+      <Step Order="6">Enable branch protection and code review requirements</Step>
+      <Step Order="7">Notify stakeholders and assess blast radius</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude authorized deployment activities during release windows</Condition>
+      <Condition>Exclude known developer workstations during active development</Condition>
+      <Condition>Documented infrastructure as code changes with approval</Condition>
+    </FalsePositiveReduction>
   </DetectionRule>
 </DetectionRules>
