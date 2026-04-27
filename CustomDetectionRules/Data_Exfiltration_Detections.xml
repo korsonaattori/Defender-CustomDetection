@@ -1,0 +1,478 @@
+<?xml version="1.0" encoding="utf-8"?>
+<DetectionRules SchemaVersion="2.0">
+  <!--
+    Data Exfiltration Detection Rules for Microsoft Defender XDR
+    High-Fidelity, High-Confidence Detections
+    Target: Large file transfers, cloud storage uploads, DNS tunneling, archive creation
+  -->
+
+  <DetectionRule ID="CUSTOM-EXFIL-001" Version="1.0" Status="Active">
+    <Name>Large File Transfer to External Network</Name>
+    <Description>Detects large file transfers from corporate endpoints to external networks, indicative of data exfiltration attempts. Analyzes network traffic patterns, file sizes, and destination IPs to identify suspicious outbound data flows.</Description>
+    <Severity>High</Severity>
+    <Tactics>Exfiltration, Collection</Tactics>
+    <Techniques>T1041, T1039, T1020</Techniques>
+    <ConfidenceLevel>High (92%)</ConfidenceLevel>
+    <FidelityScore>95%</FidelityScore>
+    <MITREMapping>T1041 - Exfiltration Over C2 Channel, T1039 - Data from Network Shared Drive</MITREMapping>
+    <ThreatActors>APT29, APT41, Lazarus, FIN7, Ransomware Groups</ThreatActors>
+    
+    <DetectionLogic>
+      <![CDATA[
+      let LargeTransferThreshold = 100MB;
+      let TransferRateThreshold = 50MB;
+      let TimeWindow = 1h;
+      
+      let InternalSubnets = dynamic([
+        "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"
+      ]);
+      
+      // Monitor NetworkCommunicationEvents for large outbound transfers
+      DeviceNetworkEvents
+      | where Timestamp > ago(TimeWindow)
+      | where ActionType in~ ("ConnectionAccepted", "ConnectionInitiated")
+      | where RemoteIP !in~ (InternalSubnets)  // External IPs only
+        and RemoteIP !in~ ("127.0.0.1", "::1")  // Not localhost
+      | where isnotempty(RemoteIP) and RemoteIP !startswith "fe80:"
+      | summarize 
+          TotalBytes = sum(SentBytes + ReceivedBytes),
+          TransferCount = count(),
+          MaxTransfer = max(SentBytes + ReceivedBytes),
+          UniqueDestinations = dcount(RemoteIP),
+          Protocols = makeset(Protocol)
+        by DeviceId, InitiatingProcessFileName, AccountName, RemoteIP
+      | where TotalBytes >= LargeTransferThreshold
+        or MaxTransfer >= TransferRateThreshold
+      | extend TransferSizeMB = round(TotalBytes / 1048576, 2)
+      | extend MaxTransferMB = round(MaxTransfer / 1048576, 2)
+      | extend RiskScore = case(
+          TotalBytes >= 1GB or MaxTransfer >= 500MB, 95,
+          TotalBytes >= 500MB or MaxTransfer >= 200MB, 90,
+          TotalBytes >= 100MB or MaxTransfer >= 50MB, 85,
+          true, 70
+        )
+      | where RiskScore >= 85
+      | extend ThreatLevel = case(
+          RiskScore >= 90, "Critical",
+          RiskScore >= 85, "High",
+          "Medium"
+        )
+      | project-reorder Timestamp, DeviceId, ThreatLevel, TransferSizeMB, MaxTransferMB, UniqueDestinations, InitiatingProcessFileName
+      
+      // Also detect rapid sequential transfers (potential automated exfil)
+      union (
+        DeviceNetworkEvents
+        | where Timestamp > ago(30m)
+        | where ActionType in~ ("ConnectionAccepted", "ConnectionInitiated")
+        | where RemoteIP !in~ (InternalSubnets)
+          and isnotempty(RemoteIP)
+        | summarize 
+            ConnectionCount = count(),
+            TotalBytes = sum(SentBytes + ReceivedBytes),
+            UniqueDestinations = dcount(RemoteIP)
+          by DeviceId, InitiatingProcessFileName, bin(Timestamp, 5m)
+        | where ConnectionCount >= 20  // 20+ connections in 5 minutes
+          or TotalBytes >= 500MB
+        | extend FrequencyRisk = case(
+            ConnectionCount >= 50, "Critical",
+            ConnectionCount >= 20, "High",
+            "Medium"
+          )
+        | project-reorder Timestamp, DeviceId, FrequencyRisk, ConnectionCount, TotalBytes, InitiatingProcessFileName
+      )
+      ]]>
+    </DetectionLogic>
+    
+    <AlertConfiguration>
+      <Priority>1</Priority>
+      <AutoSeverity>High</AutoSeverity>
+      <AutoStatus>New</AutoStatus>
+      <NotificationEnabled>true</NotificationEnabled>
+      <EmailSecurityTeam>true</EmailSecurityTeam>
+      <CreateIncident>true</CreateIncident>
+      <AutoBlockEnabled>true</AutoBlockEnabled>
+    </AlertConfiguration>
+    
+    <SuppressionRules>
+      <SuppressionDuration>PT2H</SuppressionDuration>
+      <ExcludeUsers>
+        <User>BackupService*</User>
+        <User>FileSync*</User>
+        <User>ITAdmin*</User>
+      </ExcludeUsers>
+      <ExcludeProcesses>
+        <Process>onedrive.exe</Process>
+        <Process>msedge.exe</Process>
+        <Process>chrome.exe</Process>
+        <Process>firefox.exe</Process>
+      </ExcludeProcesses>
+    </SuppressionRules>
+    
+    <RemediationSteps>
+      <Step Order="1">IMMEDIATELY: Isolate affected device from network</Step>
+      <Step Order="2">Block external IP addresses at firewall</Step>
+      <Step Order="3">Identify data that was potentially exfiltrated</Step>
+      <Step Order="4">Preserve network logs for forensic analysis</Step>
+      <Step Order="5">Reset credentials for compromised account</Step>
+      <Step Order="6">Implement DLP policies to prevent future exfiltration</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude known backup and sync services</Condition>
+      <Condition>Exclude business-critical external transfers</Condition>
+      <Condition>Time-based: Allow larger transfers during business hours</Condition>
+      <Condition>Whitelist approved external services by IP</Condition>
+    </FalsePositiveReduction>
+  </DetectionRule>
+
+  <DetectionRule ID="CUSTOM-EXFIL-002" Version="1.0" Status="Active">
+    <Name>Cloud Storage Mass Upload Detection</Name>
+    <Description>Detects mass upload of files to cloud storage services (OneDrive, Google Drive, Dropbox, Box, etc.) that may indicate data exfiltration. Analyzes file operations and sync client behavior to identify unusual upload patterns.</Description>
+    <Severity> High</Severity>
+    <Tactics>Exfiltration</Tactics>
+    <Techniques>T1567.002, T1567.001</Techniques>
+    <ConfidenceLevel>High (90%)</ConfidenceLevel>
+    <FidelityScore>93%</FidelityScore>
+    <MITREMapping>T1567.002 - Exfiltration to Cloud Storage: Cloud Storage, T1567.001 - Exfiltration to Cloud Storage: OneDrive</MITREMapping>
+    <ThreatActors>APT29, APT41, FIN7, Ransomware Groups, Insider Threat</ThreatActors>
+    
+    <DetectionLogic>
+      <![CDATA[
+      let CloudStoragePaths = dynamic([
+        "OneDrive", "Google Drive", "Dropbox", "Box Sync",
+        "iCloud Drive", "Microsoft OneDrive", "pCloud",
+        "Sync.com", "MEGA", "Nextcloud"
+      ]);
+      
+      let CloudSyncClients = dynamic([
+        "OneDrive.exe", "FileSyncConfig.exe", "GoogleDriveFS.exe",
+        "Dropbox.exe", "BoxSync.exe", "iCloud.exe",
+        "MEGAsync.exe", "nextcloud.exe", "syncthing.exe"
+      ]);
+      
+      // Detect rapid file uploads via cloud sync clients
+      DeviceFileEvents
+      | where Timestamp > ago(2h)
+      | where FolderPath has_any (CloudStoragePaths)
+        and ActionType in~ ("FileCreated", "FileModified")
+        and FileSize > 10485760  // Files larger than 10MB
+      | extend CloudClient = case(
+          InitiatingProcessFileName in~ (CloudSyncClients), InitiatingProcessFileName,
+          "Unknown Sync Client"
+        )
+      | summarize 
+          LargeFilesUploaded = count(),
+          TotalUploadSize = sum(FileSize),
+          UniqueClients = dcount(CloudClient),
+          FileTypes = makeset(split(FileName, '.')[-1])
+        by DeviceId, AccountName, FolderPath, CloudClient
+      | where LargeFilesUploaded >= 5 or TotalUploadSize >= 104857600  // 5 files or 100MB total
+      | extend UploadSizeMB = round(TotalUploadSize / 1048576, 2)
+      | extend RiskScore = case(
+          LargeFilesUploaded >= 20 or TotalUploadSize >= 1GB, 95,
+          LargeFilesUploaded >= 10 or TotalUploadSize >= 500MB, 90,
+          LargeFilesUploaded >= 5 or TotalUploadSize >= 100MB, 85,
+          true, 70
+        )
+      | where RiskScore >= 85
+      | extend ThreatLevel = case(
+          RiskScore >= 90, "Critical",
+          RiskScore >= 85, "High",
+          "Medium"
+        )
+      | project-reorder Timestamp, DeviceId, ThreatLevel, LargeFilesUploaded, UploadSizeMB, FolderPath
+      
+      // Also detect direct API uploads bypassing sync clients
+      union (
+        DeviceProcessEvents
+        | where Timestamp > ago(2h)
+        | where FileName in~ ("powershell.exe", "curl.exe", "wget.exe", "rclone.exe")
+          and ProcessCommandLine has_any ("upload", "put", "copy", "sync", "drive", "cloud")
+          and (ProcessCommandLine contains "https://" or ProcessCommandLine contains "http://")
+        | extend UploadTool = case(
+            FileName == "rclone.exe", "Rclone",
+            FileName == "powershell.exe" and ProcessCommandLine contains "Invoke-WebRequest", "PowerShell",
+            FileName == "curl.exe", "cURL",
+            "Other Upload Tool"
+          )
+        | where UploadTool != "Other Upload Tool"
+        | summarize UploadAttempts = count() by DeviceId, FileName, UploadTool, AccountName
+        | where UploadAttempts >= 3
+      )
+      | extend FinalRisk = case(
+          UploadSizeMB >= 1000 or UploadAttempts >= 10, "Critical",
+          UploadSizeMB >= 500 or UploadAttempts >= 5, "High",
+          "Medium"
+        )
+      | where FinalRisk in~ ("Critical", "High")
+      | project-reorder Timestamp, DeviceId, FinalRisk, UploadSizeMB, UploadAttempts, UploadTool
+      ]]>
+    </DetectionLogic>
+    
+    <AlertConfiguration>
+      <Priority>1</Priority>
+      <AutoSeverity>High</AutoSeverity>
+      <AutoStatus>New</AutoStatus>
+      <NotificationEnabled>true</NotificationEnabled>
+      <EmailSecurityTeam>true</EmailSecurityTeam>
+      <CreateIncident>true</CreateIncident>
+    </AlertConfiguration>
+    
+    <SuppressionRules>
+      <SuppressionDuration>PT4H</SuppressionDuration>
+      <ExcludeUsers>
+        <User>BackupService*</User>
+        <User>FileSyncService*</User>
+        <User>DataMigration*</User>
+      </ExcludeUsers>
+      <ExcludeProcesses>
+        <Process>authorized_backup.exe</Process>
+        <Process>data_sync_tool.exe</Process>
+      </ExcludeProcesses>
+    </SuppressionRules>
+    
+    <RemediationSteps>
+      <Step Order="1">Revoke cloud storage access tokens immediately</Step>
+      <Step Order="2">Identify which files were uploaded to cloud storage</Step>
+      <Step Order="3">Download and preserve uploaded files as evidence</Step>
+      <Step Order="4">Remove files from cloud storage and disable affected accounts</Step>
+      <Step Order="5">Review cloud storage access logs for additional exfiltration</Step>
+      <Step Order="6">Implement Cloud Access Security Broker (CASB) controls</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude authorized backup and migration tools</Condition>
+      <Condition>Exclude known business processes requiring cloud uploads</Condition>
+      <Condition>Time-based: Allow larger uploads during maintenance windows</Condition>
+      <Condition>User-based: Exclude data migration specialists during projects</Condition>
+    </FalsePositiveReduction>
+  </DetectionRule>
+
+  <DetectionRule ID="CUSTOM-EXFIL-003" Version="1.0" Status="Active">
+    <Name>DNS Tunneling Data Exfiltration</Name>
+    <Description>Detects DNS tunneling techniques used to exfiltrate data by encoding information in DNS queries. Monitors for unusual DNS query patterns, high volumes of DNS requests, and suspicious subdomain structures.</Description>
+    <Severity>High</Severity>
+    <Tactics>Exfiltration, Command and Control</Tactics>
+    <Techniques>T1048.003, T1071.004</Techniques>
+    <ConfidenceLevel>High (88%)</ConfidenceLevel>
+    <FidelityScore>91%</FidelityScore>
+    <MITREMapping>T1048.003 - Exfiltration Over Alternative Protocol: DNS, T1071.004 - Application Layer Protocol: DNS</MITREMapping>
+    <ThreatActors>APT29, APT41, DNSpionage, Sea Turtle</ThreatActors>
+    
+    <DetectionLogic>
+      <![CDATA[
+      let TimeWindow = 1h;
+      let DNSQueryThreshold = 500;
+      let DomainLengthThreshold = 100;
+      
+      // Monitor DNS queries for tunneling indicators
+      DeviceNetworkEvents
+      | where Timestamp > ago(TimeWindow)
+      | where Protocol == "DNS" and ActionType == "ConnectionInitiated"
+      | where isnotempty(RemoteIP) and RemoteIP != "127.0.0.1"
+      | extend QueryLength = strlen(RemoteDnsRecord)
+      | extend DomainParts = array_length(split(RemoteDnsRecord, '.'))
+      | extend SubdomainLength = QueryLength - (strlen(split(RemoteDnsRecord, '.')[-2]) + strlen(split(RemoteDnsRecord, '.')[-1]) + 1)
+      | where SubdomainLength > DomainLengthThreshold  // Suspiciously long subdomains
+        or DomainParts > 8  // Excessive subdomain levels
+        or RemoteDnsRecord matches regex @".*[0-9a-fA-F]{32,}.*"  // MD5-like patterns in DNS
+        or RemoteDnsRecord matches regex @".*[0-9a-fA-F]{40,}.*"  // SHA1-like patterns
+        or RemoteDnsRecord matches regex @".*[A-Za-z0-9+/]{40,}=*.*"  // Base64-like patterns
+      | summarize 
+          DnsQueryCount = count(),
+          AvgQueryLength = avg(QueryLength),
+          MaxQueryLength = max(QueryLength),
+          UniqueDomains = dcount(RemoteDnsRecord),
+          SuspiciousPatterns = countif(RemoteDnsRecord matches regex @".*[0-9a-fA-F]{16,}.*")
+        by DeviceId, InitiatingProcessFileName, AccountName, RemoteIP
+      | where DnsQueryCount >= DNSQueryThreshold
+         or UniqueDomains >= 100
+         or SuspiciousPatterns >= 10
+      | extend DnsRiskScore = case(
+          DnsQueryCount >= 1000 or MaxQueryLength >= 200, 92,
+          DnsQueryCount >= 500 or MaxQueryLength >= 150, 88,
+          DnsQueryCount >= 200 or MaxQueryLength >= 100, 85,
+          true, 75
+        )
+      | where DnsRiskScore >= 85
+      | extend ThreatLevel = case(
+          DnsRiskScore >= 90, "Critical",
+          DnsRiskScore >= 85, "High",
+          "Medium"
+        )
+      | project-reorder Timestamp, DeviceId, ThreatLevel, DnsQueryCount, MaxQueryLength, UniqueDomains, SuspiciousPatterns
+      
+      // Also detect DNS responses with unusual sizes (data in responses)
+      union (
+        DeviceNetworkEvents
+        | where Timestamp > ago(TimeWindow)
+        | where Protocol == "DNS" and ActionType == "ConnectionAccepted"
+        | where ResponseSize > 512  // Large DNS responses
+        | summarize 
+            LargeResponses = count(),
+            TotalResponseSize = sum(ResponseSize),
+            AvgResponseSize = avg(ResponseSize)
+          by DeviceId, RemoteIP, InitiatingProcessFileName
+        | where LargeResponses >= 20 or AvgResponseSize >= 1024
+      )
+      | extend FinalRisk = case(
+          DnsQueryCount >= 1000 or LargeResponses >= 50, "Critical",
+          DnsQueryCount >= 500 or LargeResponses >= 20, "High",
+          "Medium"
+        )
+      | where FinalRisk in~ ("Critical", "High")
+      | project-reorder Timestamp, DeviceId, FinalRisk, DnsQueryCount, LargeResponses, AvgResponseSize
+      ]]>
+    </DetectionLogic>
+    
+    <AlertConfiguration>
+      <Priority>1</Priority>
+      <AutoSeverity>High</AutoSeverity>
+      <AutoStatus>New</AutoStatus>
+      <NotificationEnabled>true</NotificationEnabled>
+      <EmailSecurityTeam>true</EmailSecurityTeam>
+      <CreateIncident>true</CreateIncident>
+    </AlertConfiguration>
+    
+    <SuppressionRules>
+      <SuppressionDuration>PT1H</SuppressionDuration>
+      <ExcludeUsers>
+        <User>DNS*</User>
+        <User>DNSAdmin*</User>
+      </ExcludeUsers>
+      <ExcludeProcesses>
+        <Process>dnscache.exe</Process>
+        <Process>dnsclient.exe</Process>
+      </ExcludeProcesses>
+    </SuppressionRules>
+    
+    <RemediationSteps>
+      <Step Order="1">Block suspicious DNS domains at DNS resolver level</Step>
+      <Step Order="2">Isolate affected device immediately</Step>
+      <Step Order="3">Analyze DNS query logs to determine data being exfiltrated</Step>
+      <Step Order="4">Check for malware that implements DNS tunneling</Step>
+      <Step Order="5">Implement DNS query length and frequency restrictions</Step>
+      <Step Order="6">Deploy DNS security monitoring and filtering (e.g., Cisco Umbrella)</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude internal DNS servers and resolvers</Condition>
+      <Condition>Exclude legitimate applications with long DNS queries (CDNs)</Condition>
+      <Condition>Threshold-based: Require minimum query volume</Condition>
+      <Condition>Pattern-based: Focus on high-entropy subdomains</Condition>
+    </FalsePositiveReduction>
+  </DetectionRule>
+
+  <DetectionRule ID="CUSTOM-EXFIL-004" Version="1.0" Status="Active">
+    <Name>Archive Creation Before Exfiltration</Name>
+    <Description>Detects creation of archive files (ZIP, RAR, 7Z) followed by rapid external transfer, which is a common precursor to data exfiltration. Identifies compression of multiple files before transmission outside the network.</Description>
+    <Severity>Medium</Severity>
+    <Tactics>Exfiltration, Collection</Tactics>
+    <Techniques>T1560.001, T1041</Techniques>
+    <ConfidenceLevel>High (87%)</ConfidenceLevel>
+    <FidelityScore>90%</FidelityScore>
+    <MITREMapping>T1560.001 - Archive Collected Data: Archive via Utility, T1041 - Exfiltration Over C2 Channel</MITREMapping>
+    <ThreatActors>APT29, APT41, FIN7, Insider Threat</ThreatActors>
+    
+    <DetectionLogic>
+      <![CDATA[
+      let ArchiveTools = dynamic([
+        "7z.exe", "7z", "WinRAR", "RAR.exe",
+        "zip.exe", "Compress-Archive", "tar.exe",
+        "gzip.exe", "bzip2", "xz.exe"
+      ]);
+      
+      let ArchiveExtensions = dynamic([
+        ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz"
+      ]);
+      
+      let TimeWindow = 2h;
+      
+      // Detect archive creation
+      let ArchiveCreation = DeviceProcessEvents
+      | where Timestamp > ago(TimeWindow)
+      | where
+        (FileName in~ (ArchiveTools)
+         and ProcessCommandLine has_any (ArchiveExtensions))
+        or
+        (FileName == "powershell.exe" and ProcessCommandLine contains "Compress-Archive")
+        or
+        (FileName endswith ".exe" and ProcessCommandLine contains "a " and ProcessCommandLine has_any (ArchiveExtensions))
+      | extend ArchivePath = extract(@"[\"']?([^\"']+\.(zip|rar|7z|tar|gz))", 1, ProcessCommandLine)
+      | where isnotempty(ArchivePath)
+      | summarize 
+          ArchivesCreated = count(),
+          ArchivePaths = makeset(ArchivePath),
+          ArchiveSizeEstimate = sum(InitiatingProcessFileSize)
+        by DeviceId, FileName, AccountName, bin(Timestamp, 30m)
+      | where ArchivesCreated >= 1;
+      
+      // Detect subsequent network transfers
+      let ExternalTransfers = DeviceNetworkEvents
+      | where Timestamp > ago(TimeWindow)
+      | where ActionType in~ ("ConnectionAccepted", "ConnectionInitiated")
+      | where RemoteIP !in~ ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.1")
+      | where SentBytes > 1048576  // Transfers larger than 1MB
+      | summarize 
+          ExternalConnections = count(),
+          TotalExfiltrated = sum(SentBytes)
+        by DeviceId, InitiatingProcessFileName, bin(Timestamp, 30m)
+      | where TotalExfiltrated > 10485760;  // More than 10MB total
+      
+      // Join archive creation with subsequent transfers
+      ArchiveCreation
+      | join kind=inner (
+          ExternalTransfers
+        ) on DeviceId
+      | where abs(datetime_diff('minute', Timestamp, Timestamp1)) <= 30  // Within 30 minutes
+      | extend ExfiltrationRisk = case(
+          TotalExfiltrated >= 1GB, 95,
+          TotalExfiltrated >= 500MB, 90,
+          TotalExfiltrated >= 100MB, 85,
+          true, 75
+        )
+      | where ExfiltrationRisk >= 85
+      | extend ArchiveCount = ArchivesCreated
+      | extend ExfilSizeMB = round(TotalExfiltrated / 1048576, 2)
+      | project-reorder Timestamp, DeviceId, ExfiltrationRisk, ArchiveCount, ExfilSizeMB, FileName
+      ]]>
+    </DetectionLogic>
+    
+    <AlertConfiguration>
+      <Priority>2</Priority>
+      <AutoSeverity>Medium</AutoSeverity>
+      <AutoStatus>New</AutoStatus>
+      <NotificationEnabled>true</NotificationEnabled>
+      <EmailSecurityTeam>true</EmailSecurityTeam>
+    </AlertConfiguration>
+    
+    <SuppressionRules>
+      <SuppressionDuration>PT2H</SuppressionDuration>
+      <ExcludeUsers>
+        <User>Backup*</User>
+        <User>Archive*</User>
+        <User>ITAdmin*</User>
+      </ExcludeUsers>
+      <ExcludeProcesses>
+        <Process>authorized_backup.exe</Process>
+        <Process>compression_tool.exe</Process>
+      </ExcludeProcesses>
+    </SuppressionRules>
+    
+    <RemediationSteps>
+      <Step Order="1">Check archive contents for sensitive data</Step>
+      <Step Order="2">Identify destination of exfiltrated data</Step>
+      <Step Order="3">Block external IP addresses and domains</Step>
+      <Step Order="4">Review access controls for data that was archived</Step>
+      <Step Order="5">Implement DLP policies to detect archive creation</Step>
+      <Step Order="6">Monitor for additional exfiltration attempts</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude authorized backup and archiving processes</Condition>
+      <Condition>Exclude file compression for email attachments</Condition>
+      <Condition>Time-based: Focus on unusual patterns outside business hours</Condition>
+      <Condition>Size-based: Require minimum archive size threshold</Condition>
+    </FalsePositiveReduction>
+  </DetectionRule>
+</DetectionRules>

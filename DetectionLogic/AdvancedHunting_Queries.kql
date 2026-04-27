@@ -1,0 +1,323 @@
+//
+// Advanced Hunting Queries for Custom Detection Validation
+// Microsoft Defender XDR
+//
+
+// =============================================================================
+// RANSOMWARE DETECTION QUERIES
+// =============================================================================
+
+// Detect rapid file encryption activity
+let EncryptionThreshold = 10;
+let TimeWindow = 5m;
+DeviceFileEvents
+| where Timestamp > ago(TimeWindow)
+| where ActionType in~ ("FileCreated", "FileModified")
+| where FileSize > 1024
+| extend Extension = tostring(split(FileName, '.')[-1])
+| where Extension in~ ("encrypted", "locked", "crypto", "enc", "crypt")
+   or PreviousFileName !~ FileName
+| summarize 
+    FilesAffected = dcount(SHA256),
+    UniqueExtensions = makeset(Extension),
+    TotalSize = sum(FileSize)
+  by DeviceId, InitiatingProcessFileName, InitiatingProcessCommandLine
+| where FilesAffected >= EncryptionThreshold
+| order by FilesAffected desc
+
+// Detect shadow copy deletion attempts
+DeviceProcessEvents
+| where Timestamp > ago(1h)
+| where FileName in~ ("vssadmin.exe", "wmic.exe", "powershell.exe")
+  and (ProcessCommandLine has "shadow" and ProcessCommandLine has "delete")
+   or (ProcessCommandLine has "bcdedit" and ProcessCommandLine has "recoveryenabled no")
+| extend CommandLower = tolower(ProcessCommandLine)
+| where CommandLower !contains "#" and CommandLower !contains "test"
+| project Timestamp, DeviceId, FileName, ProcessCommandLine, AccountName
+
+// =============================================================================
+// LATERAL MOVEMENT DETECTION QUERIES
+// =============================================================================
+
+// Detect SMB lateral movement
+let TimeWindow = 4h;
+DeviceNetworkEvents
+| where Timestamp > ago(TimeWindow)
+| where Protocol == "SMB" or RemotePort in~ (445, 139)
+  and ActionType in~ ("ConnectionAccepted", "ConnectionInitiated")
+| summarize SMBConnections = dcount(RemoteDeviceName) by DeviceId, InitiatingProcessFileName
+| where SMBConnections >= 5
+| join kind=inner (
+    DeviceProcessEvents
+    | where Timestamp > ago(TimeWindow)
+    | where FileName in~ ("psexec.exe", "wmic.exe", "powershell.exe")
+  ) on DeviceId
+| where FileName !~ InitiatingProcessFileName
+
+// Detect WMI lateral movement
+DeviceProcessEvents
+| where Timestamp > ago(2h)
+| where FileName in~ ("wmiprvse.exe", "wmic.exe")
+  and InitiatingProcessFileName !in~ ("services.exe", "svchost.exe")
+| extend TargetDevice = extract(@"\\\\([^\\\\]+)", 1, ProcessCommandLine)
+| where isnotempty(TargetDevice)
+| project Timestamp, DeviceId, InitiatingProcessFileName, ProcessCommandLine, TargetDevice, AccountName
+
+// =============================================================================
+// CREDENTIAL THEFT DETECTION QUERIES
+// =============================================================================
+
+// Detect LSASS memory access
+DeviceProcessEvents
+| where Timestamp > ago(1h)
+| where TargetProcessName in~ ("lsass.exe", "LSASS.exe")
+  and InitiatingProcessFileName !in~ ("MsMpEng.exe", "svchost.exe", "services.exe")
+  and InitiatingProcessFileName !startswith "conhost"
+| extend AccessMask = extract(@"0x[0-9a-fA-F]+", 0, ProcessCommandLine)
+| summarize AccessCount = count() by DeviceId, InitiatingProcessFileName, TargetProcessName, AccountName
+| where AccessCount >= 1
+
+// Detect Kerberoasting attempts
+SecurityEvent
+| where TimeGenerated > ago(1h)
+| where EventID == 4769
+  and TicketEncryptionType == 0x17  // RC4 encryption
+| extend AccountName = tolower(Account)
+| summarize 
+    TicketRequests = count(),
+    UniqueServices = dcount(ServiceName)
+  by AccountName, IpAddress, Computer
+| where TicketRequests >= 5 or UniqueServices >= 3
+| order by TicketRequests desc
+
+// =============================================================================
+// PERSISTENCE DETECTION QUERIES
+// =============================================================================
+
+// Detect autorun registry modifications
+DeviceRegistryEvents
+| where Timestamp > ago(4h)
+| where RegistryKey has_any (
+    "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+    "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
+  )
+  and ActionType in~ ("RegistryValueSet", "RegistryValueCreated")
+| extend ValueData = tostring(RegistryValue)
+| where ValueData has_any ("powershell", "cmd.exe", "wscript", "rundll32")
+| summarize RegistryModifications = count() by DeviceId, RegistryKey, AccountName
+| where RegistryModifications >= 1
+
+// Detect scheduled task creation
+DeviceProcessEvents
+| where Timestamp > ago(4h)
+| where FileName in~ ("schtasks.exe", "powershell.exe")
+  and ProcessCommandLine has_any ("/Create", "/create", "New-ScheduledTask")
+| summarize TaskCreations = count() by DeviceId, FileName, AccountName
+| where TaskCreations >= 1
+
+// =============================================================================
+// DATA EXFILTRATION DETECTION QUERIES
+// =============================================================================
+
+// Detect large outbound transfers
+let LargeTransferThreshold = 100MB;
+DeviceNetworkEvents
+| where Timestamp > ago(1h)
+| where Protocol in~ ("HTTP", "HTTPS", "FTP")
+  and RemoteIP !in~ ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+| summarize TotalBytes = sum(SentBytes)
+  by DeviceId, RemoteIP, InitiatingProcessFileName
+| where TotalBytes >= LargeTransferThreshold
+| extend TransferSizeMB = round(TotalBytes / 1048576, 2)
+| order by TransferSizeMB desc
+
+// Detect cloud storage uploads
+DeviceFileEvents
+| where Timestamp > ago(2h)
+| where FolderPath has_any (
+    "OneDrive", "Google Drive", "Dropbox",
+    "Microsoft OneDrive", "iCloud Drive"
+  )
+  and ActionType in~ ("FileCreated", "FileModified")
+  and FileSize > 10485760
+| summarize LargeFiles = count(), TotalSize = sum(FileSize)
+  by DeviceId, FolderPath, AccountName
+| where LargeFiles >= 5 or TotalSize >= 104857600
+
+// =============================================================================
+// LIVING OFF THE LAND DETECTION QUERIES
+// =============================================================================
+
+// Detect malicious PowerShell execution
+DeviceProcessEvents
+| where Timestamp > ago(1h)
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+  and (ProcessCommandLine has "-enc" or ProcessCommandLine has "-EncodedCommand")
+   or (ProcessCommandLine has "IEX" and ProcessCommandLine has "DownloadString")
+| extend RiskLevel = case(
+    ProcessCommandLine matches regex @"-enc[oA-Za-z]*\s+[A-Za-z0-9+/=]{20,}", "Critical",
+    ProcessCommandLine has "IEX" and ProcessCommandLine has "http", "High",
+    "Medium"
+  )
+| where RiskLevel in~ ("Critical", "High")
+| project Timestamp, DeviceId, FileName, ProcessCommandLine, RiskLevel, AccountName
+
+// Detect certutil abuse for file download
+DeviceProcessEvents
+| where Timestamp > ago(2h)
+| where FileName in~ ("certutil.exe")
+  and ProcessCommandLine has_any ("-urlcache", "urlcache")
+  and ProcessCommandLine has_any ("http://", "https://", "ftp://")
+| project Timestamp, DeviceId, FileName, ProcessCommandLine, AccountName
+
+// =============================================================================
+// PRIVILEGE ESCALATION DETECTION QUERIES
+// =============================================================================
+
+// Detect UAC bypass via registry
+DeviceRegistryEvents
+| where Timestamp > ago(4h)
+| where RegistryKey has "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System"
+  and RegistryValueName in~ ("EnableLUA", "ConsentPromptBehaviorAdmin", "PromptOnSecureDesktop")
+  and RegistryValue in~ ("0", "disabled", "false")
+| project Timestamp, DeviceId, RegistryKey, RegistryValueName, RegistryValue, AccountName
+
+// Detect token impersonation
+DeviceApiCalls
+| where Timestamp > ago(2h)
+| where ApiName in~ ("CreateProcessWithTokenW", "ImpersonateLoggedOnUser", "DuplicateTokenEx")
+  and InitiatingProcessFileName !in~ ("lsass.exe", "svchost.exe", "services.exe")
+| summarize ApiCalls = count() by DeviceId, InitiatingProcessFileName, ApiName, AccountName
+| where ApiCalls >= 2
+
+// =============================================================================
+// INITIAL ACCESS DETECTION QUERIES
+// =============================================================================
+
+// Detect phishing URL navigation
+DeviceNetworkEvents
+| where Timestamp > ago(1h)
+| where Protocol in~ ("HTTP", "HTTPS")
+  and RemoteDnsRecord has_any (
+    "login-microsoft.com", "outlook-secure.com",
+    "webmail-login.com", "verify", "confirm"
+  )
+  and InitiatingProcessFileName in~ ("msedge.exe", "chrome.exe", "firefox.exe")
+| project Timestamp, DeviceId, RemoteDnsRecord, InitiatingProcessFileName, AccountName
+
+// Detect malicious attachment execution
+DeviceProcessEvents
+| where Timestamp > ago(4h)
+| where FileName has_any (".exe", ".scr", ".vbs", ".js", ".ps1")
+  and FolderPath has_any ("\\Users\\", "\\Downloads\\", "\\Temp\\")
+  and FileName !startswith "Windows Defender"
+| extend Extension = tostring(split(FileName, '.')[-1])
+| where Extension in~ ("exe", "scr", "vbs", "js", "ps1")
+| project Timestamp, DeviceId, FileName, FolderPath, Extension, AccountName
+
+// =============================================================================
+// CROSS-DETECTION CORRELATION QUERIES
+// =============================================================================
+
+// Correlate multiple suspicious activities on same device within time window
+let SuspiciousActivities = union
+(
+    // LSASS access
+    DeviceProcessEvents
+    | where Timestamp > ago(4h)
+      and TargetProcessName in~ ("lsass.exe")
+    | project Timestamp, DeviceId, Activity = "LSASS_Access", AccountName
+    ,
+    // Registry autorun modification
+    DeviceRegistryEvents
+    | where Timestamp > ago(4h)
+      and RegistryKey has "Run"
+      and ActionType in~ ("RegistryValueSet")
+    | project Timestamp, DeviceId, Activity = "Registry_Modification", AccountName
+    ,
+    // Suspicious process creation
+    DeviceProcessEvents
+    | where Timestamp > ago(4h)
+      and FileName in~ ("cmd.exe", "powershell.exe", "wscript.exe")
+      and InitiatingProcessFileName in~ ("winword.exe", "excel.exe", "outlook.exe")
+    | project Timestamp, DeviceId, Activity = "Suspicious_Process", AccountName
+);
+SuspiciousActivities
+| summarize Activities = makeset(Activity), Count = count() by DeviceId, AccountName
+| where Count >= 2
+| order by Count desc
+
+// =============================================================================
+// ALERT EFFECTIVENESS MONITORING QUERIES
+// =============================================================================
+
+// Monitor custom detection alert performance
+let StartDate = ago(30d);
+DeviceAlertEvents
+| where Timestamp > StartDate
+| where AlertTitle contains "CUSTOM"
+| extend SeverityLevel = case(
+    Severity == "Critical", 4,
+    Severity == "High", 3,
+    Severity == "Medium", 2,
+    1
+  )
+| summarize 
+    TotalAlerts = count(),
+    AvgSeverity = avg(SeverityLevel),
+    CriticalAlerts = countif(Severity == "Critical"),
+    HighAlerts = countif(Severity == "High")
+  by AlertTitle
+| order by TotalAlerts desc
+
+// Track alert resolution times
+DeviceAlertEvents
+| where Timestamp > ago(30d)
+| where AlertTitle contains "CUSTOM"
+  and isnotempty(ResolvedTime)
+| extend ResolutionTime = datetime_diff('hour', ResolvedTime, Timestamp)
+| summarize 
+    AvgResolutionHours = avg(ResolutionTime),
+    MaxResolutionHours = max(ResolutionTime),
+    TotalResolved = count()
+  by AlertTitle
+| order by AvgResolutionHours desc
+
+// =============================================================================
+// THREAT HUNTING QUERIES
+// =============================================================================
+
+// Hunt for undetected credential dumping
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where (FileName in~ ("procdump.exe", "rundll32.exe")
+      or ProcessCommandLine has_any ("MiniDump", "comsvcs.dll"))
+  and InitiatingProcessFileName !in~ ("MsMpEng.exe", "svchost.exe")
+| extend Indicator = case(
+    FileName == "procdump.exe", "ProcDump Usage",
+    ProcessCommandLine contains "comsvcs.dll", "Comsvcs Dump",
+    "Other Suspicious"
+  )
+| project Timestamp, DeviceId, Indicator, ProcessCommandLine, AccountName
+
+// Hunt for lateral movement via RDP
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where Protocol == "RDP" and RemotePort == 3389
+  and ActionType == "ConnectionAccepted"
+| summarize RDPConnections = dcount(RemoteDeviceName) by DeviceId, AccountName
+| where RDPConnections >= 5
+
+// Hunt for data staging
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FileName endswith ".zip" or FileName endswith ".rar"
+  and FolderPath has_any ("\\Users\\", "\\Temp\\", "\\AppData\\")
+  and FileSize > 10485760
+| summarize ArchiveCreations = count(), TotalSize = sum(FileSize)
+  by DeviceId, FolderPath, AccountName
+| where ArchiveCreations >= 3 or TotalSize >= 52428800
+
+// =============================================================================
+// END OF QUERIES
+// =============================================================================

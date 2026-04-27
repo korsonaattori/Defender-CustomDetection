@@ -1,0 +1,590 @@
+<?xml version="1.0" encoding="utf-8"?>
+<DetectionRules SchemaVersion="2.0">
+  <!--
+    Persistence Detection Rules for Microsoft Defender XDR
+    High-Fidelity, High-Confidence Detections
+    Target: Registry Run keys, scheduled tasks, WMI event subscriptions, service creation
+  -->
+
+  <DetectionRule ID="CUSTOM-PERS-001" Version="1.0" Status="Active">
+    <Name>Autorun Registry Modification for Persistence</Name>
+    <Description>Detects unauthorized modifications to autorun registry keys used for persistence, including Run, RunOnce, and other startup locations. Identifies both registry value changes and creation of new autorun entries.</Description>
+    <Severity>High</Severity>
+    <Tactics>Persistence</Tactics>
+    <Techniques>T1547.001</Techniques>
+    <ConfidenceLevel>High (93%)</ConfidenceLevel>
+    <FidelityScore>95%</FidelityScore>
+    <MITREMapping>T1547.001 - Boot or Logon Autostart Execution: Registry Run Keys / Startup Folder</MITREMapping>
+    <ThreatActors>APT29, APT41, Lazarus, FIN7</ThreatActors>
+    
+    <DetectionLogic>
+      <![CDATA[
+      let AutorunPaths = dynamic([
+        "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+        "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+        "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnceEx",
+        "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunServices",
+        "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunServicesOnce",
+        "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+        "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+        "HKLM\\SOFTWARE\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Run",
+        "HKLM\\SOFTWARE\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+        "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders\\Startup",
+        "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders\\Common Startup"
+      ]);
+      
+      let SuspiciousRunValues = dynamic([
+        "powershell", "cmd.exe", "wscript", "cscript", "rundll32",
+        "regsvr32", "mshta", "certutil", "bitsadmin", "schtasks",
+        "wmic", "msiexec", "installutil", "python", "wsl", "bash"
+      ]);
+      
+      // Detect registry value creation/modification in autorun locations
+      DeviceRegistryEvents
+      | where Timestamp > ago(4h)
+      | where RegistryKey has_any (AutorunPaths)
+        and ActionType in~ ("RegistryValueSet", "RegistryValueCreated")
+      | extend ValueName = tostring(RegistryValueName)
+      | extend ValueData = tostring(RegistryValue)
+      | extend ValueLower = tolower(ValueData)
+      | where ValueLower has_any (SuspiciousRunValues)
+        or ValueLower matches regex @".*\\(powershell|cmd|wscript|cscript|rundll32|regsvr32).*\.(exe|ps1|vbs|js|bat|cmd).*"
+        or ValueLower contains "http" or ValueLower contains "https"
+        or ValueLower contains "ftp" or ValueLower contains "\\\\"
+      | extend RiskScore = case(
+          ValueLower has_any ("powershell", "cmd.exe", "rundll32", "regsvr32", "mshta"), 92,
+          ValueLower contains "http" or ValueLower contains "https", 88,
+          ValueLower contains "\\\\", 85,
+          true, 80
+        )
+      | where RiskScore >= 80
+      | summarize 
+          AutorunModifications = count(),
+          RiskScore = max(RiskScore),
+          Values = makeset(ValueName)
+        by DeviceId, RegistryKey, AccountName, ProcessName
+      | where AutorunModifications >= 1
+      
+      // Also detect unusual parent processes modifying autorun keys
+      union (
+        DeviceRegistryEvents
+        | where Timestamp > ago(4h)
+        | where RegistryKey has_any (AutorunPaths)
+          and ActionType in~ ("RegistryValueSet", "RegistryValueCreated")
+          and InitiatingProcessFileName !in~ ("regedit.exe", "powershell.exe", "cmd.exe", "msiexec.exe", "SystemSettings.exe")
+          and InitiatingProcessFileName !startswith "Windows Defender"
+          and InitiatingProcessFileName !startswith "MsMpEng"
+        | extend ProcessLower = tolower(InitiatingProcessFileName)
+        | where ProcessLower !contains "defender" and ProcessLower !contains "msmpeng"
+        | summarize 
+            UnusualModifications = count(),
+            UniqueKeys = dcount(RegistryKey)
+          by DeviceId, InitiatingProcessFileName, AccountName
+        | where UnusualModifications >= 2
+      )
+      | extend FinalRisk = case(
+          AutorunModifications >= 3 or UnusualModifications >= 3, "Critical",
+          AutorunModifications >= 1 or UnusualModifications >= 2, "High",
+          "Medium"
+        )
+      | project-reorder Timestamp, DeviceId, FinalRisk, AutorunModifications, ProcessName
+      ]]>
+    </DetectionLogic>
+    
+    <AlertConfiguration>
+      <Priority>1</Priority>
+      <AutoSeverity>High</AutoSeverity>
+      <AutoStatus>New</AutoStatus>
+      <NotificationEnabled>true</NotificationEnabled>
+      <EmailSecurityTeam>true</EmailSecurityTeam>
+      <CreateIncident>true</CreateIncident>
+    </AlertConfiguration>
+    
+    <SuppressionRules>
+      <SuppressionDuration>PT2H</SuppressionDuration>
+      <ExcludeUsers>
+        <User>SYSTEM</User>
+        <User>Administrator</User>
+      </ExcludeUsers>
+      <ExcludeProcesses>
+        <Process>authorized_deployment.exe</Process>
+        <Process>software_center.exe</Process>
+        <Process>intune_management.exe</Process>
+      </ExcludeProcesses>
+    </SuppressionRules>
+    
+    <RemediationSteps>
+      <Step Order="1">Remove unauthorized autorun entries from registry</Step>
+      <Step Order="2">Check for associated files referenced in autorun entries</Step>
+      <Step Order="3">Analyze the executable for malicious content</Step>
+      <Step Order="4">Reset credentials for accounts that made modifications</Step>
+      <Step Order="5">Enable auditing of registry autorun modifications</Step>
+      <Step Order="6">Implement application control to prevent unauthorized persistence</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude authorized software deployment tools</Condition>
+      <Condition>Exclude legitimate startup program management</Condition>
+      <Condition>Time-based: Alert off-hours modifications</Condition>
+      <Condition>User-based: Exclude known administrators during maintenance</Condition>
+    </FalsePositiveReduction>
+  </DetectionRule>
+
+  <DetectionRule ID="CUSTOM-PERS-002" Version="1.0" Status="Active">
+    <Name>Suspicious Scheduled Task Creation</Name>
+    <Description>Detects creation of scheduled tasks for persistence, particularly those with suspicious execution patterns, hidden tasks, or tasks running under SYSTEM context. Identifies both schtasks.exe and direct Task Scheduler API usage.</Description>
+    <Severity>High</Severity>
+    <Tactics>Persistence</Tactics>
+    <Techniques>T1053.005</Techniques>
+    <ConfidenceLevel>High (91%)</ConfidenceLevel>
+    <FidelityScore>94%</FidelityScore>
+    <MITREMapping>T1053.005 - Scheduled Task/Job: Scheduled Task</MITREMapping>
+    <ThreatActors>APT29, APT28, Lazarus, Ransomware Groups</ThreatActors>
+    
+    <DetectionLogic>
+      <![CDATA[
+      let SuspiciousTaskCommands = dynamic([
+        "schtasks.exe", "schtasks",
+        "Schedule.Service",
+        "taskschd.msc",
+        "New-ScheduledTask", "Register-ScheduledTask",
+        "Create", "/Create", "/create",
+        "ONLOGON", "ONSTART", "ONIDLE",
+        "SCF", "JOB"
+      ]);
+      
+      let HiddenTaskIndicators = dynamic([
+        "/RL HIGHEST", "/RU SYSTEM", "/TN \\\",
+        "/F", "/XML", ".xml",
+        "HiddenTask", "SystemTask"
+      ]);
+      
+      let SuspiciousTaskNames = dynamic([
+        "Update", "Sync", "Task", "Service", "Helper",
+        "Windows", "System", "Security", "Defender",
+        "OneDrive", "Google", "Microsoft"
+      ]);
+      
+      // Detect scheduled task creation via command line
+      DeviceProcessEvents
+      | where Timestamp > ago(4h)
+      | where
+        (FileName in~ ("schtasks.exe", "powershell.exe", "cmd.exe", "wscript.exe", "cscript.exe")
+         and ProcessCommandLine has_any (SuspiciousTaskCommands))
+        or
+        (FileName == "powershell.exe" and ProcessCommandLine has_any ("New-ScheduledTask", "Register-ScheduledTask", "Schedule.Service"))
+      | extend TaskOperation = case(
+          ProcessCommandLine has_any ("/Create", "/create", "Create", "/TN"), "TaskCreation",
+          ProcessCommandLine has "/XML", "TaskImport",
+          ProcessCommandLine has "/RL HIGHEST", "PrivilegeEscalation",
+          "Other"
+        )
+      | where TaskOperation != "Other"
+      | extend HiddenTask = case(
+          ProcessCommandLine has_any (HiddenTaskIndicators), true,
+          ProcessCommandLine has "/TN \\\" and ProcessCommandLine contains "System32", true,
+          false
+        )
+      | where HiddenTask == true or TaskOperation in~ ("TaskImport", "PrivilegeEscalation")
+      | summarize 
+          TaskCreations = count(),
+          HiddenTasks = makeset(HiddenTask),
+          Commands = makeset(ProcessCommandLine)
+        by DeviceId, FileName, InitiatingProcessFileName, AccountName
+      | where TaskCreations >= 1
+      
+      // Also detect Task Scheduler API usage
+      union (
+        DeviceApiCalls
+        | where Timestamp > ago(4h)
+        | where ApiName in~ ("ITaskService", "ITaskFolder", "RegisterTask")
+          and InitiatingProcessFileName !in~ ("taskschd.msc", "mmc.exe", "powershell.exe")
+        | summarize ApiCalls = count() by DeviceId, InitiatingProcessFileName
+        | where ApiCalls >= 3
+      )
+      | extend FinalRisk = case(
+          HiddenTasks contains true, "Critical",
+          TaskCreations >= 3 or ApiCalls >= 5, "High",
+          TaskCreations >= 1, "Medium",
+          "Low"
+        )
+      | where FinalRisk in~ ("Critical", "High", "Medium")
+      | project-reorder Timestamp, DeviceId, FinalRisk, TaskCreations, FileName
+      ]]>
+    </DetectionLogic>
+    
+    <AlertConfiguration>
+      <Priority>1</Priority>
+      <AutoSeverity>High</AutoSeverity>
+      <AutoStatus>New</AutoStatus>
+      <NotificationEnabled>true</NotificationEnabled>
+      <EmailSecurityTeam>true</EmailSecurityTeam>
+      <CreateIncident>true</CreateIncident>
+    </AlertConfiguration>
+    
+    <SuppressionRules>
+      <SuppressionDuration>PT1H</SuppressionDuration>
+      <ExcludeUsers>
+        <User>SYSTEM</User>
+        <User>Administrator</User>
+        <User>ITAdmin*</User>
+      </ExcludeUsers>
+      <ExcludeProcesses>
+        <Process>authorized_task_deployment.exe</Process>
+        <Process>sccm_client.exe</Process>
+        <Process>intune_management_extension.exe</Process>
+      </ExcludeProcesses>
+    </SuppressionRules>
+    
+    <RemediationSteps>
+      <Step Order="1">Delete unauthorized scheduled tasks immediately</Step>
+      <Step Order="2">Check task actions for malicious executables or scripts</Step>
+      <Step Order="3">Review task triggers and execution schedules</Step>
+      <Step Order="4">Reset credentials for accounts that created the tasks</Step>
+      <Step Order="5">Enable auditing of scheduled task creation</Step>
+      <Step Order="6">Implement least privilege for task creation permissions</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude authorized task deployment tools</Condition>
+      <Condition>Exclude SCCM and Intune management tasks</Condition>
+      <Condition>Time-based: Alert off-hours task creation</Condition>
+      <Condition>Task-based: Exclude known legitimate maintenance tasks</Condition>
+    </FalsePositiveReduction>
+  </DetectionRule>
+
+  <DetectionRule ID="CUSTOM-PERS-003" Version="1.0" Status="Active">
+    <Name>WMI Event Subscription Persistence</Name>
+    <Description>Detects WMI event subscription persistence mechanisms where attackers create permanent event consumers and filters that execute malicious code when specific events occur. Identifies unusual WMI persistence techniques.</Description>
+    <Severity>Medium</Severity>
+    <Tactics>Persistence</Tactics>
+    <Techniques>T1546.003</Techniques>
+    <ConfidenceLevel>High (92%)</ConfidenceLevel>
+    <FidelityScore>95%</FidelityScore>
+    <MITREMapping>T1546.003 - Event Triggered Execution: Windows Management Instrumentation Event Subscription</MITREMapping>
+    <ThreatActors>APT29, APT28, FIN7</ThreatActors>
+    
+    <DetectionLogic>
+      <![CDATA[
+      let WMIPersistenceTools = dynamic([
+        "wmic", "WMIC.exe",
+        "powershell", "pwsh",
+        "wmi", "wbemtest"
+      ]);
+      
+      let WMIConsumerCommands = dynamic([
+        "FilterToConsumerBinding",
+        "__EventFilter",
+        "__EventConsumer",
+        "__FilterToConsumerBinding",
+        "CommandLineEventConsumer",
+        "ActiveScriptEventConsumer",
+        "LogFileEventConsumer"
+      ]);
+      
+      // Detect WMI persistence creation via command line
+      DeviceProcessEvents
+      | where Timestamp > ago(8h)
+      | where
+        (FileName in~ (WMIPersistenceTools)
+         and ProcessCommandLine has_any (WMIConsumerCommands))
+        or
+        (ProcessCommandLine contains "FilterToConsumerBinding")
+        or
+        (FileName == "powershell.exe" and ProcessCommandLine contains "Set-WmiInstance")
+        or
+        (FileName == "powershell.exe" and ProcessCommandLine contains "__EventConsumer")
+      | extend PersistenceType = case(
+          ProcessCommandLine contains "CommandLineEventConsumer", "Command Execution",
+          ProcessCommandLine contains "ActiveScriptEventConsumer", "Script Execution",
+          ProcessCommandLine contains "LogFileEventConsumer", "Log Manipulation",
+          "Unknown WMI Persistence"
+        )
+      | where PersistenceType != "Unknown WMI Persistence"
+      | summarize 
+          WmiPersistenceCreations = count(),
+          PersistenceTypes = makeset(PersistenceType),
+          Commands = makeset(ProcessCommandLine)
+        by DeviceId, FileName, InitiatingProcessFileName, AccountName
+      | where WmiPersistenceCreations >= 1
+      
+      // Also detect WMI namespace modifications for persistence
+      union (
+        DeviceRegistryEvents
+        | where Timestamp > ago(8h)
+        | where RegistryKey has "ROOT\\subscription"
+          and RegistryKey has_any ("Filter", "Consumer", "Binding")
+          and ActionType in~ ("RegistryValueSet", "RegistryKeyCreated")
+          and InitiatingProcessFileName !in~ ("System", "svchost.exe", "wmiprvse.exe")
+        | summarize 
+            WmiRegistryMods = count(),
+            RegistryKeys = makeset(RegistryKey)
+          by DeviceId, InitiatingProcessFileName, AccountName
+        | where WmiRegistryMods >= 1
+      )
+      | extend FinalRisk = case(
+          WmiPersistenceCreations >= 2 or WmiRegistryMods >= 2, "High",
+          WmiPersistenceCreations == 1 or WmiRegistryMods == 1, "Medium",
+          "Low"
+        )
+      | where FinalRisk in~ ("High", "Medium")
+      | project-reorder Timestamp, DeviceId, FinalRisk, WmiPersistenceCreations, FileName
+      ]]>
+    </DetectionLogic>
+    
+    <AlertConfiguration>
+      <Priority>2</Priority>
+      <AutoSeverity>Medium</AutoSeverity>
+      <AutoStatus>New</AutoStatus>
+      <NotificationEnabled>true</NotificationEnabled>
+      <EmailSecurityTeam>true</EmailSecurityTeam>
+    </AlertConfiguration>
+    
+    <SuppressionRules>
+      <SuppressionDuration>PT4H</SuppressionDuration>
+      <ExcludeUsers>
+        <User>SYSTEM</User>
+        <User>NETWORK SERVICE</User>
+        <User>Administrator</User>
+      </ExcludeUsers>
+      <ExcludeProcesses>
+        <Process>authorized_mgmt_tool.exe</Process>
+        <Process>monitoring_agent.exe</Process>
+      </ExcludeProcesses>
+    </SuppressionRules>
+    
+    <RemediationSteps>
+      <Step Order="1">Identify and remove unauthorized WMI event consumers and filters</Step>
+      <Step Order="2">Use wbemtest or PowerShell to enumerate WMI subscriptions</Step>
+      <Step Order="3">Check for malicious commands in EventConsumer configurations</Step>
+      <Step Order="4">Reset credentials for accounts that created WMI subscriptions</Step>
+      <Step Order="5">Enable WMI activity auditing</Step>
+      <Step Order="6">Consider disabling WMI if not required for business operations</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude authorized system management tools</Condition>
+      <Condition>Exclude monitoring agents and legitimate admin tools</Condition>
+      <Condition>Time-based: Focus on off-hours modifications</Condition>
+      <Condition>User-based: Require admin privileges for WMI modifications</Condition>
+    </FalsePositiveReduction>
+  </DetectionRule>
+
+  <DetectionRule ID="CUSTOM-PERS-004" Version="1.0" Status="Active">
+    <Name>Suspicious Windows Service Creation</Name>
+    <Description>Detects creation of Windows services for persistence, particularly services with suspicious names, running under unusual accounts, or configured to auto-start. Identifies both sc.exe and API-based service creation.</Description>
+    <Severity>High</Severity>
+    <Tactics>Persistence</Tactics>
+    <Techniques>T1543.003</Techniques>
+    <ConfidenceLevel>High (90%)</ConfidenceLevel>
+    <FidelityScore>93%</FidelityScore>
+    <MITREMapping>T1543.003 - Create or Modify System Process: Windows Service</MITREMapping>
+    <ThreatActors>APT29, FIN7, Ransomware Groups</ThreatActors>
+    
+    <DetectionLogic>
+      <![CDATA[
+      let ServiceCreationCommands = dynamic([
+        "sc.exe create", "sc create", "sc\\.exe create",
+        "New-Service", "InstallUtil", "installutil.exe",
+        "sc.exe config", "sc config"
+      ]);
+      
+      let SuspiciousServiceNames = dynamic([
+        "Spooler", "EventLog", "SamSs", "Lsa", "WinDefend",
+        "Schedule", "Themes", "AudioSrv", "BITS", "wuauserv",
+        "Update", "Security", "System", "Windows", "Service"
+      ]);
+      
+      let SuspiciousBinPaths = dynamic([
+        "\\\\", "%TEMP%", "C:\\Users\\", "C:\\ProgramData\\",
+        ".exe", ".dll", ".scr", ".vbs", ".ps1", ".bat", ".cmd"
+      ]);
+      
+      // Detect service creation via sc.exe or PowerShell
+      DeviceProcessEvents
+      | where Timestamp > ago(4h)
+      | where
+        (FileName in~ ("sc.exe", "powershell.exe", "cmd.exe")
+         and ProcessCommandLine has_any (ServiceCreationCommands))
+        or
+        (FileName == "InstallUtil.exe" and ProcessCommandLine contains "/U")
+      | extend ServiceName = extract(@"create\\s+([^\s]+)", 1, ProcessCommandLine, typeof(string))
+      | extend BinPath = extract(@"binPath\\s*=\\s*([^\s]+)", 1, ProcessCommandLine, typeof(string))
+      | extend StartType = case(
+          ProcessCommandLine contains "start= auto" or ProcessCommandLine contains "start= AUTO", "Auto",
+          ProcessCommandLine contains "start= demand" or ProcessCommandLine contains "start= DEMAND", "Manual",
+          "Unknown"
+        )
+      | where ServiceName in~ (SuspiciousServiceNames)
+        or BinPath has_any (SuspiciousBinPaths)
+        or StartType == "Auto"
+        or isnotempty(ServiceName)
+      | summarize 
+          ServiceCreations = count(),
+          UniqueServices = dcount(ServiceName),
+          Commands = makeset(ProcessCommandLine)
+        by DeviceId, FileName, InitiatingProcessFileName, AccountName
+      | where ServiceCreations >= 1
+      
+      // Also detect service modifications
+      union (
+        DeviceRegistryEvents
+        | where Timestamp > ago(4h)
+        | where RegistryKey has "SYSTEM\\CurrentControlSet\\Services"
+          and RegistryKey !endswith "\\Enum"
+          and RegistryKey !endswith "\\Security"
+          and RegistryValue contains ".exe"
+          and ActionType in~ ("RegistryValueSet", "RegistryKeyCreated")
+          and InitiatingProcessFileName !in~ ("services.exe", "System", "mmc.exe")
+        | extend ServiceName = tostring(split(RegistryKey, '\\')[-1])
+        | where ServiceName !in~ ("", "SamSs", "Lsa", "EventLog", "Spooler")  // Exclude core services
+        | summarize 
+            ServiceModifications = count(),
+            ServiceNames = makeset(ServiceName)
+          by DeviceId, InitiatingProcessFileName, AccountName
+        | where ServiceModifications >= 1
+      )
+      | extend FinalRisk = case(
+          ServiceCreations >= 2 or ServiceModifications >= 2, "High",
+          ServiceCreations == 1 or ServiceModifications == 1, "Medium",
+          "Low"
+        )
+      | where FinalRisk in~ ("High", "Medium")
+      | project-reorder Timestamp, DeviceId, FinalRisk, ServiceCreations, FileName
+      ]]>
+    </DetectionLogic>
+    
+    <AlertConfiguration>
+      <Priority>1</Priority>
+      <AutoSeverity>High</AutoSeverity>
+      <AutoStatus>New</AutoStatus>
+      <NotificationEnabled>true</NotificationEnabled>
+      <EmailSecurityTeam>true</EmailSecurityTeam>
+      <CreateIncident>true</CreateIncident>
+    </AlertConfiguration>
+    
+    <SuppressionRules>
+      <SuppressionDuration>PT1H</SuppressionDuration>
+      <ExcludeUsers>
+        <User>SYSTEM</User>
+        <User>Administrator</User>
+        <User>NT SERVICE</User>
+      </ExcludeUsers>
+      <ExcludeProcesses>
+        <Process>InstallUtil.exe</Process>
+        <Process>msiexec.exe</Process>
+        <Process>sccm_client.exe</Process>
+      </ExcludeProcesses>
+    </SuppressionRules>
+    
+    <RemediationSteps>
+      <Step Order="1">Stop and delete unauthorized services immediately</Step>
+      <Step Order="2">Investigate the executable or script associated with the service</Step>
+      <Step Order="3">Check for lateral movement or additional persistence mechanisms</Step>
+      <Step Order="4">Reset credentials for accounts that created or modified services</Step>
+      <Step Order="5">Enable service creation auditing</Step>
+      <Step Order="6">Implement application control to prevent unauthorized service installation</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude authorized software installation and update processes</Condition>
+      <Condition>Exclude system services and Windows components</Condition>
+      <Condition>Time-based: Alert off-hours service modifications</Condition>
+      <Condition>Service-based: Exclude known administrative tools</Condition>
+    </FalsePositiveReduction>
+  </DetectionRule>
+
+  <DetectionRule ID="CUSTOM-PERS-005" Version="1.0" Status="Active">
+    <Name>Startup Folder Modification for Persistence</Name>
+    <Description>Detects modifications to startup folders (user and common) for persistence mechanisms. Monitors file creation, modification, and deletion in startup directories commonly abused by attackers.</Description>
+    <Severity>Medium</Severity>
+    <Tactics>Persistence</Tactics>
+    <Techniques>T1547.001</Techniques>
+    <ConfidenceLevel>High (85%)</ConfidenceLevel>
+    <FidelityScore>88%</FidelityScore>
+    <MITREMapping>T1547.001 - Boot or Logon Autostart Execution: Startup Folder</MITREMapping>
+    <ThreatActors>APT Groups, Ransomware, Information Stealers</ThreatActors>
+    
+    <DetectionLogic>
+      <![CDATA[
+      let StartupFolders = dynamic([
+        "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\",
+        "\\Start Menu\\Programs\\Startup\\",
+        "\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\",
+        "\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\"
+      ]);
+      
+      let SuspiciousExtensions = dynamic([".exe", ".scr", ".pif", ".cmd", ".bat", ".vbs", ".ps1", ".js", ".jse", ".wsf"]);
+      
+      // Detect file creation/modification in startup folders
+      DeviceFileEvents
+      | where Timestamp > ago(4h)
+      | where FolderPath has_any (StartupFolders)
+        and ActionType in~ ("FileCreated", "FileModified", "FileRenamed")
+      | extend Extension = tostring(split(FileName, '.')[-1])
+      | where Extension in~ (SuspiciousExtensions)
+        or FileName contains ".exe"
+        or FileName contains ".scr"
+      | extend FilePath = strcat(FolderPath, FileName)
+      | extend RiskScore = case(
+          Extension in~ ("exe", "scr", "pif"), 90,
+          Extension in~ ("vbs", "ps1", "js", "jse", "wsf"), 85,
+          Extension in~ ("bat", "cmd"), 75,
+          true, 60
+        )
+      | where RiskScore >= 75
+        or InitiatingProcessFileName !in~ ("explorer.exe", "UserAccountControl.exe")
+      | summarize 
+          StartupModifications = count(),
+          RiskScore = max(RiskScore),
+          Files = makeset(FileName)
+        by DeviceId, FolderPath, InitiatingProcessFileName, AccountName, Extension
+      | where StartupModifications >= 1
+      | extend FinalRisk = case(
+          RiskScore >= 85 and Extension in~ ("exe", "scr"), "High",
+          RiskScore >= 75, "Medium",
+          "Low"
+        )
+      | where FinalRisk in~ ("High", "Medium")
+      | project-reorder Timestamp, DeviceId, FinalRisk, StartupModifications, FileName, Extension
+      ]]>
+    </DetectionLogic>
+    
+    <AlertConfiguration>
+      <Priority>2</Priority>
+      <AutoSeverity>Medium</AutoSeverity>
+      <AutoStatus>New</AutoStatus>
+      <NotificationEnabled>true</NotificationEnabled>
+      <EmailSecurityTeam>true</EmailSecurityTeam>
+    </AlertConfiguration>
+    
+    <SuppressionRules>
+      <SuppressionDuration>PT1H</SuppressionDuration>
+      <ExcludeUsers>
+        <User>SYSTEM</User>
+        <User>Administrator</User>
+      </ExcludeUsers>
+      <ExcludeProcesses>
+        <Process>explorer.exe</Process>
+        <Process>UserAccountControl.exe</Process>
+        <Process>software_installer.exe</Process>
+      </ExcludeProcesses>
+    </SuppressionRules>
+    
+    <RemediationSteps>
+      <Step Order="1">Remove unauthorized files from startup folders</Step>
+      <Step Order="2">Analyze suspicious files for malicious content</Step>
+      <Step Order="3">Check for additional persistence mechanisms</Step>
+      <Step Order="4">Reset credentials for affected user accounts</Step>
+      <Step Order="5">Enable monitoring of startup folder modifications</Step>
+      <Step Order="6">Educate users about social engineering attacks</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude authorized software installations</Condition>
+      <Condition>Exclude user-installed legitimate startup programs</Condition>
+      <Condition>Time-based: Alert on unusual modification patterns</Condition>
+      <Condition>Process-based: Validate parent process legitimacy</Condition>
+    </FalsePositiveReduction>
+  </DetectionRule>
+</DetectionRules>

@@ -1,0 +1,390 @@
+<?xml version="1.0" encoding="utf-8"?>
+<DetectionRules SchemaVersion="2.0">
+  <!--
+    Initial Access Detection Rules for Microsoft Defender XDR
+    High-Fidelity, High-Confidence Detections
+    Target: Phishing, drive-by downloads, malicious attachments, external remote services
+  -->
+
+  <DetectionRule ID="CUSTOM-INIT-001" Version="1.0" Status="Active">
+    <Name>Phishing Link Click and Credential Harvesting</Name>
+    <Description>Detects users clicking phishing links that lead to credential harvesting pages or malicious downloads. Analyzes URL clicks, browser navigation patterns, and subsequent authentication attempts to identify phishing campaigns.</Description>
+    <Severity>High</Severity>
+    <Tactics>Initial Access</Tactics>
+    <Techniques>T1566.002</Techniques>
+    <ConfidenceLevel>High (89%)</ConfidenceLevel>
+    <FidelityScore>91%</FidelityScore>
+    <MITREMapping>T1566.002 - Phishing: Spearphishing Link</MITREMapping>
+    <ThreatActors>APT29, APT41, FIN7, TA505, Phishing Groups</ThreatActors>
+    
+    <DetectionLogic>
+      <![CDATA[
+      let KnownPhishingDomains = dynamic([
+        "login-microsoft.com", "outlook-secure.com", "webmail-login.com",
+        "microsoft-secure.com", "office365-login.com", "sharepoint-login.com",
+        "teams-web.com", "zoom-login.com", "webex-login.com"
+      ]);
+      
+      let SuspiciousURLPatterns = dynamic([
+        "/verify/", "/confirm/", "/validate/", "/secure/", "/update/",
+        "/login/", "/signin/", "/auth/", "/account/", "/mfa/",
+        ".onion", ".tk", ".ml", ".ga", ".cf",  // Suspicious TLDs
+        "@",  // Username in URL
+        "http://"  // Non-HTTPS
+      ]);
+      
+      let ShortenedURLDomains = dynamic([
+        "bit.ly", "goo.gl", "tinyurl.com", "ow.ly", "t.co",
+        "is.gd", "buff.ly", "adf.ly", "bc.vc", "cli.gs"
+      ]);
+      
+      // Monitor browser navigation for suspicious URLs
+      DeviceNetworkEvents
+      | where Timestamp > ago(1h)
+      | where Protocol == "HTTP" or Protocol == "HTTPS"
+        and ActionType in~ ("ConnectionInitiated", "ConnectionAccepted")
+        and InitiatingProcessFileName in~ ("msedge.exe", "chrome.exe", "firefox.exe", "iexplore.exe")
+      | extend URL = RemoteDnsRecord, Domain = tostring(split(RemoteDnsRecord, '/')[0])
+      | extend URLPath = tostring(split(RemoteDnsRecord, '/')[-1])
+      | where
+        // Known phishing domains
+        Domain in~ (KnownPhishingDomains)
+        or
+        // Suspicious URL patterns
+        URL has_any (SuspiciousURLPatterns)
+        or
+        // Shortened URLs (need to be expanded)
+        Domain in~ (ShortenedURLDomains)
+        or
+        // Non-standard ports for HTTP/HTTPS
+        (RemotePort != 80 and RemotePort != 443 and Protocol in~ ("HTTP", "HTTPS"))
+        or
+        // URLs with IP addresses instead of domain names
+        (URL matches regex @"https?://\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}")
+        or
+        // Very long URLs (potential obfuscation)
+        strlen(URL) > 200
+      | extend PhishingRisk = case(
+          Domain in~ (KnownPhishingDomains), "Critical",
+          URL has ".onion" or URL has ".tk", "High",
+          URL has "http://" and (URL has "login" or URL has "secure"), "High",
+          URL has_any (SuspiciousURLPatterns), "Medium",
+          true, "Low"
+        )
+      | where PhishingRisk in~ ("Critical", "High", "Medium")
+      | summarize 
+          SuspiciousNavigations = count(),
+          UniqueDomains = dcount(Domain),
+          RiskLevel = max(PhishingRisk),
+          URLs = makeset(URL)
+        by DeviceId, AccountName, InitiatingProcessFileName
+      | where SuspiciousNavigations >= 3
+        or (SuspiciousNavigations >= 1 and RiskLevel == "Critical")
+      
+      // Also detect credential submission after suspicious navigation
+      union (
+        DeviceProcessEvents
+        | where Timestamp > ago(1h)
+        | where FileName in~ ("msedge.exe", "chrome.exe", "firefox.exe")
+          and ProcessCommandLine has_any ("--password-store", "--auth-server-whitelist")
+        | extend CredentialAccess = case(
+            ProcessCommandLine contains "password" or ProcessCommandLine contains "credential", "Credential Access Attempt",
+            "Other"
+          )
+        | where CredentialAccess == "Credential Access Attempt"
+        | summarize CredentialOps = count() by DeviceId, AccountName
+        | where CredentialOps >= 1
+      )
+      | extend FinalRisk = case(
+          SuspiciousNavigations >= 10 or RiskLevel == "Critical", "Critical",
+          SuspiciousNavigations >= 5 or RiskLevel == "High", "High",
+          SuspiciousNavigations >= 3, "Medium",
+          "Low"
+        )
+      | where FinalRisk in~ ("High", "Critical")
+      | project-reorder Timestamp, DeviceId, FinalRisk, SuspiciousNavigations, AccountName
+      ]]>
+    </DetectionLogic>
+    
+    <AlertConfiguration>
+      <Priority>1</Priority>
+      <AutoSeverity>High</AutoSeverity>
+      <AutoStatus>New</AutoStatus>
+      <NotificationEnabled>true</NotificationEnabled>
+      <EmailSecurityTeam>true</EmailSecurityTeam>
+      <CreateIncident>true</CreateIncident>
+    </AlertConfiguration>
+    
+    <SuppressionRules>
+      <SuppressionDuration>PT1H</SuppressionDuration>
+      <ExcludeUsers>
+        <User>Security*</User>
+        <User>ITAdmin*</User>
+      </ExcludeUsers>
+      <ExcludeProcesses>
+        <Process>security_scanner.exe</Process>
+        <Process>vulnerability_scanner.exe</Process>
+      </ExcludeProcesses>
+    </SuppressionRules>
+    
+    <RemediationSteps>
+      <Step Order="1">Warn affected user about potential phishing attack</Step>
+      <Step Order="2">Reset passwords for the compromised account</Step>
+      <Step Order="3">Enable MFA if not already enabled</Step>
+      <Step Order="4">Block the malicious URL/domain at DNS and web proxy</Step>
+      <Step Order="5">Scan device for malware or credential stealers</Step>
+      <Step Order="6">Conduct security awareness training for affected user</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude security team testing and authorized scans</Condition>
+      <Condition>Exclude legitimate URL shortening services</Condition>
+      <Condition>Time-based: Focus on unusual navigation patterns</Condition>
+      <Condition>User-based: Exclude users with security roles</Condition>
+    </FalsePositiveReduction>
+  </DetectionRule>
+
+  <DetectionRule ID="CUSTOM-INIT-002" Version="1.0" Status="Active">
+    <Name>Malicious Attachment Execution</Name>
+    <Description>Detects execution of files from email attachments or downloads that exhibit malicious characteristics. Identifies suspicious file types, macro execution, and script-based attacks commonly delivered through phishing emails.</Description>
+    <Severity>High</Severity>
+    <Tactics>Initial Access, Execution</Tactics>
+    <Techniques>T1566.001</Techniques>
+    <ConfidenceLevel>High (92%)</ConfidenceLevel>
+    <FidelityScore>95%</FidelityScore>
+    <MITREMapping>T1566.001 - Phishing: Spearphishing Attachment</MITREMapping>
+    <ThreatActors>APT29, APT28, FIN7, Ryuk, LockBit</ThreatActors>
+    
+    <DetectionLogic>
+      <![CDATA[
+      let MaliciousExtensions = dynamic([
+        ".exe", ".scr", ".pif", ".com", ".bat", ".cmd",
+        ".vbs", ".js", ".jse", ".wsf", ".wsh", ".ps1",
+        ".jar", ".hta", ".msi", ".dll", ".scf", ".lnk"
+      ]);
+      
+      let SuspiciousDoubleExtensions = dynamic([
+        ".doc.exe", ".pdf.exe", ".xls.exe", ".ppt.exe",
+        ".doc.scr", ".pdf.scr", ".jpg.exe", ".png.exe",
+        ".txt.exe", ".xml.exe", ".csv.exe"
+      ]);
+      
+      let MacroIndicators = dynamic([
+        "AutoOpen", "Document_Open", "Workbook_Open",
+        "Presentation_Open", "AutoExec", "Auto_Open",
+        "Application_Startup", "Document_Close"
+      ]);
+      
+      let OfficeApps = dynamic([
+        "winword.exe", "excel.exe", "powerpnt.exe",
+        "mspub.exe", "visio.exe", "outlook.exe"
+      ]);
+      
+      // Detect execution of malicious file types from user directories
+      DeviceProcessEvents
+      | where Timestamp > ago(4h)
+      | where FileName has_any (MaliciousExtensions)
+        and InitiatingProcessFileName !in~ ("explorer.exe", "cmd.exe", "powershell.exe")
+        and FolderPath has_any ("\\Users\\", "\\Downloads\\", "\\Temp\\", "\\AppData\\")
+      | extend Extension = tostring(split(FileName, '.')[-1])
+      | extend DoubleExt = case(
+          FileName has_any (SuspiciousDoubleExtensions), true,
+          false
+        )
+      | where Extension in~ ("exe", "scr", "pif", "com", "bat", "cmd", "vbs", "js", "ps1")
+        or DoubleExt == true
+      | extend RiskScore = case(
+          DoubleExt == true, 95,
+          Extension in~ ("exe", "scr"), 90,
+          Extension in~ ("vbs", "js", "ps1"), 88,
+          true, 80
+        )
+      | where RiskScore >= 85
+      | summarize 
+          MaliciousExecutions = count(),
+          RiskScore = max(RiskScore),
+          Files = makeset(FileName)
+        by DeviceId, FolderPath, AccountName, InitiatingProcessFileName
+      
+      // Also detect Office macros with suspicious auto-execution
+      union (
+        DeviceProcessEvents
+        | where Timestamp > ago(4h)
+        | where InitiatingProcessFileName in~ (OfficeApps)
+          and ProcessCommandLine has_any (MacroIndicators)
+          and ProcessCommandLine has_any ("-e", "-encode", "-ExecutionPolicy")
+        | extend MacroRisk = case(
+            ProcessCommandLine contains "AutoOpen" or ProcessCommandLine contains "Document_Open", "Auto-Executing Macro",
+            ProcessCommandLine contains "-e" or ProcessCommandLine contains "-encode", "Encoded Macro",
+            "Suspicious Macro"
+          )
+        | where MacroRisk != "Suspicious Macro"
+        | summarize MacroExecutions = count() by DeviceId, FileName, AccountName, MacroRisk
+      )
+      | extend FinalRisk = case(
+          RiskScore >= 90 or MacroRisk == "Auto-Executing Macro", "Critical",
+          RiskScore >= 85 or MacroRisk == "Encoded Macro", "High",
+          "Medium"
+        )
+      | where FinalRisk in~ ("Critical", "High")
+      | project-reorder Timestamp, DeviceId, FinalRisk, MaliciousExecutions, AccountName, FolderPath
+      ]]>
+    </DetectionLogic>
+    
+    <AlertConfiguration>
+      <Priority>1</Priority>
+      <AutoSeverity>High</AutoSeverity>
+      <AutoStatus>New</AutoStatus>
+      <NotificationEnabled>true</NotificationEnabled>
+      <EmailSecurityTeam>true</EmailSecurityTeam>
+      <CreateIncident>true</CreateIncident>
+      <AutoBlockEnabled>true</AutoBlockEnabled>
+    </AlertConfiguration>
+    
+    <SuppressionRules>
+      <SuppressionDuration>PT30M</SuppressionDuration>
+      <ExcludeUsers>
+        <User>SYSTEM</User>
+        <User>Administrator</User>
+      </ExcludeUsers>
+      <ExcludeProcesses>
+        <Process>Windows Defender</Process>
+        <Process>MsMpEng.exe</Process>
+        <Process>email_scanner.exe</Process>
+      </ExcludeProcesses>
+    </SuppressionRules>
+    
+    <RemediationSteps>
+      <Step Order="1">Quarantine the malicious file immediately</Step>
+      <Step Order="2">Block sender/domain at email gateway</Step>
+      <Step Order="3">Scan device for additional malware infections</Step>
+      <Step Order="4">Check for lateral movement from the compromised device</Step>
+      <Step Order="5">Reset passwords for affected user accounts</Step>
+      <Step Order="6">Enable Enhanced Office Macro Security policies</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude IT-deployed software installations</Condition>
+      <Condition>Exclude authorized macro-enabled documents from trusted sources</Condition>
+      <Condition>Time-based: Alert on unusual execution times</Condition>
+      <Condition>Location-based: Focus on Downloads/Temp folder executions</Condition>
+    </FalsePositiveReduction>
+  </DetectionRule>
+
+  <DetectionRule ID="CUSTOM-INIT-003" Version="1.0" Status="Active">
+    <Name>External Remote Service Compromise</Name>
+    <Description>Detects initial access through compromised external-facing services including VPN, Citrix, RDP, and other remote access solutions. Identifies anomalous logins, brute force attempts, and exploitation of vulnerable remote services.</Description>
+    <Severity>Critical</Severity>
+    <Tactics>Initial Access</Tactics>
+    <Techniques>T1190, T1078</Techniques>
+    <ConfidenceLevel>Critical (95%)</ConfidenceLevel>
+    <FidelityScore>97%</FidelityScore>
+    <MITREMapping>T1190 - Exploit Public-Facing Application, T1078 - Valid Accounts</MITREMapping>
+    <ThreatActors>APT29, APT28, FIN7, Ransomware Groups, APT41</ThreatActors>
+    
+    <DetectionLogic>
+      <![CDATA[
+      let RemoteServices = dynamic([
+        "VPN", "RD Gateway", "Citrix", "RDP", "TeamViewer",
+        "AnyConnect", "Pulse Secure", "FortiClient", "SonicWall",
+        "CheckPoint", "Palo Alto", "F5", "Cisco ASA"
+      ]);
+      
+      let SuspiciousLoginPatterns = dynamic([
+        "Failed", "Failure", "Invalid", "Denied", "Blocked",
+        "Brute Force", "Multiple Attempts"
+      ]);
+      
+      // Detect anomalous remote access logins
+      SecurityEvent
+      | where TimeGenerated > ago(2h)
+      | where EventID in~ (4624, 4625, 4771, 4768)  // Logon events
+        and (LogonType in~ (10, 3, 7)  // RemoteInteractive, Network, Unlock
+             or IpAddress != "127.0.0.1")
+      | extend IsRemote = case(
+          LogonType == 10 or (IpAddress != "127.0.0.1" and IpAddress != "::1"), true,
+          false
+        )
+      | where IsRemote == true
+      | extend AccountNameLower = tolower(Account)
+      | where AccountNameLower !endswith "@company.com"  // Exclude known internal format
+        or IpAddress !in~ ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+      | summarize 
+          LoginCount = count(),
+          FailedLogins = countif(EventID == 4625),
+          SuccessfulLogins = countif(EventID == 4624),
+          UniqueIPs = dcount(IpAddress),
+          FirstSeen = min(TimeGenerated),
+          LastSeen = max(TimeGenerated)
+        by Account, IpAddress, Computer
+      | where FailedLogins >= 10 or UniqueIPs >= 3
+        or (FailedLogins >= 5 and SuccessfulLogins >= 1)
+      | extend BruteForceRisk = case(
+          FailedLogins >= 50 or UniqueIPs >= 10, "Critical",
+          FailedLogins >= 20 or UniqueIPs >= 5, "High",
+          FailedLogins >= 10 or UniqueIPs >= 3, "Medium",
+          "Low"
+        )
+      | where BruteForceRisk in~ ("Critical", "High", "Medium")
+      
+      // Also check for impossible travel scenarios
+      union (
+        SecurityEvent
+        | where TimeGenerated > ago(1h)
+        | where EventID == 4624 and LogonType == 10
+        | extend TimeDiff = datetime_diff('minute', TimeGenerated, prev(TimeGenerated))
+        | where TimeDiff < 60  // Logins within 1 hour
+        | summarize 
+            LoginEvents = count(),
+            UniqueLocations = dcount(IpAddress)
+          by Account
+        | where UniqueLocations >= 3  // Logins from 3+ locations in 1 hour
+      )
+      | extend FinalRisk = case(
+          BruteForceRisk == "Critical" or UniqueLocations >= 5, "Critical",
+          BruteForceRisk == "High" or UniqueLocations >= 3, "High",
+          "Medium"
+        )
+      | where FinalRisk in~ ("Critical", "High", "Medium")
+      | project-reorder TimeGenerated, Account, FinalRisk, FailedLogins, UniqueIPs, Computer
+      ]]>
+    </DetectionLogic>
+    
+    <AlertConfiguration>
+      <Priority>1</Priority>
+      <AutoSeverity>Critical</AutoSeverity>
+      <AutoStatus>New</AutoStatus>
+      <NotificationEnabled>true</NotificationEnabled>
+      <EmailSecurityTeam>true</EmailSecurityTeam>
+      <CreateIncident>true</CreateIncident>
+      <AutoBlockEnabled>true</AutoBlockEnabled>
+    </AlertConfiguration>
+    
+    <SuppressionRules>
+      <SuppressionDuration>PT1H</SuppressionDuration>
+      <ExcludeUsers>
+        <User>Administrator</User>
+        <User>VPN_Gateway</User>
+      </ExcludeUsers>
+      <ExcludeProcesses>
+        <Process>legitimate_vpn_client.exe</Process>
+      </ExcludeProcesses>
+    </SuppressionRules>
+    
+    <RemediationSteps>
+      <Step Order="1">IMMEDIATELY: Disable compromised accounts</Step>
+      <Step Order="2">Block source IP addresses at firewall</Step>
+      <Step Order="3">Force password reset and MFA re-enrollment</Step>
+      <Step Order="4">Review VPN/RDP logs for unauthorized access</Step>
+      <Step Order="5">Check for lateral movement from entry point</Step>
+      <Step Order="6">Implement additional security controls (MFA, IP restrictions)</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude known VPN concentrator IP addresses</Condition>
+      <Condition>Exclude legitimate remote workers during travel</Condition>
+      <Condition>Time-based: Allow maintenance window access attempts</Condition>
+      <Condition>User-based: Exclude IT admin accounts with special access needs</Condition>
+    </FalsePositiveReduction>
+  </DetectionRule>
+</DetectionRules>

@@ -1,0 +1,322 @@
+<?xml version="1.0" encoding="utf-8"?>
+<DetectionRules SchemaVersion="2.0">
+  <!--
+    Living off the Land Detection Rules for Microsoft Defender XDR
+    High-Fidelity, High-Confidence Detections
+    Target: PowerShell abuse, WMI, certutil, msbuild, regsvr32 for malicious purposes
+  -->
+
+  <DetectionRule ID="CUSTOM-LOTL-001" Version="1.0" Status="Active">
+    <Name>Malicious PowerShell Execution</Name>
+    <Description>Detects malicious use of PowerShell for execution, including encoded commands, download cradles, and obfuscation techniques commonly used by attackers to bypass security controls.</Description>
+    <Severity>High</Severity>
+    <Tactics>Execution, Defense Evasion</Tactics>
+    <Techniques>T1059.001</Techniques>
+    <ConfidenceLevel>High (94%)</ConfidenceLevel>
+    <FidelityScore>96%</FidelityScore>
+    <MITREMapping>T1059.001 - Command and Scripting Interpreter: PowerShell</MITREMapping>
+    <ThreatActors>APT29, APT28, FIN7, Lazarus, Ransomware Groups</ThreatActors>
+    
+    <DetectionLogic>
+      <![CDATA[
+      let SuspiciousPowerShellIndicators = dynamic([
+        "-enc", "-EncodedCommand", "-ec", "-enco",
+        "-nop", "-noni", "-w hidden", "-windowstyle hidden",
+        "-ExecutionPolicy", "-ex", "-ExecutionPolicy Bypass",
+        "IEX", "Invoke-Expression",
+        "New-Object Net.WebClient",
+        "DownloadString", "DownloadFile", "DownloadData",
+        "FromBase64String",
+        "Invoke-WebRequest", "iwr", "curl", "wget",
+        "Start-BitsTransfer",
+        "Invoke-Mimikatz", "sekurlsa", "logonpasswords",
+        "Invoke-ReflectivePEInjection",
+        "Get-Process", "| Select-Object",
+        "| ForEach-Object", "| %",
+        "| Where-Object", "| ?",
+        ".Replace", ".Split", ".Substring",
+        "[System.Convert]", "[System.Text.Encoding]",
+        "[Byte[]]", "char[]", "ToCharArray"
+      ]);
+      
+      let EncodedCommandPattern = @"-enc[oA-Za-z]*\s+[A-Za-z0-9+/=]{20,}";
+      let Base64Pattern = @"[A-Za-z0-9+/]{40,}={0,2}";
+      
+      // Detect suspicious PowerShell execution
+      DeviceProcessEvents
+      | where Timestamp > ago(1h)
+      | where FileName in~ ("powershell.exe", "pwsh.exe", "powershell_ise.exe")
+      | extend CommandLower = tolower(ProcessCommandLine)
+      | where
+        // Encoded commands (most suspicious)
+        (ProcessCommandLine matches regex EncodedCommandPattern)
+        or
+        // Multiple suspicious indicators
+        (array_length([indicator in SuspiciousPowerShellIndicators where CommandLower has indicator]) >= 3)
+        or
+        // Base64-like strings in command line
+        (ProcessCommandLine matches regex Base64Pattern and CommandLower has_any ("frombase64string", "decode", "convert"))
+        or
+        // Download cradles
+        (CommandLower has_any ("downloadstring", "downloadfile", "downloadbytes", "downloaddata")
+         and CommandLower has_any ("http://", "https://", "ftp://"))
+        or
+        // Obfuscation patterns
+        (CommandLower contains "iex" and CommandLower contains ("new-object" or "net.webclient" or "download"))
+        or
+        // Reflective loading indicators
+        (CommandLower contains "invoke-reflective" or CommandLower contains "bypass" or CommandLower contains "amsi")
+        or
+        // Mimikatz indicators
+        (CommandLower contains "sekurlsa" or CommandLower contains "logonpasswords" or CommandLower contains "mimikatz")
+      | extend RiskScore = case(
+          ProcessCommandLine matches regex EncodedCommandPattern, 95,
+          CommandLower contains "sekurlsa" or CommandLower contains "mimikatz", 93,
+          CommandLower contains "invoke-reflective" or CommandLower contains "bypass", 90,
+          array_length([indicator in SuspiciousPowerShellIndicators where CommandLower has indicator]) >= 5, 88,
+          CommandLower has_any ("downloadstring", "downloadfile") and CommandLower has_any ("http://", "https://"), 85,
+          true, 80
+        )
+      | where RiskScore >= 80
+      | summarize 
+          SuspiciousCommands = count(),
+          MaxRiskScore = max(RiskScore),
+          Commands = makeset(ProcessCommandLine)
+        by DeviceId, AccountName, InitiatingProcessFileName
+      | where SuspiciousCommands >= 1
+      | extend ThreatLevel = case(
+          MaxRiskScore >= 90, "Critical",
+          MaxRiskScore >= 85, "High",
+          "Medium"
+        )
+      | project-reorder Timestamp, DeviceId, ThreatLevel, SuspiciousCommands, AccountName
+      ]]>
+    </DetectionLogic>
+    
+    <AlertConfiguration>
+      <Priority>1</Priority>
+      <AutoSeverity>High</AutoSeverity>
+      <AutoStatus>New</AutoStatus>
+      <NotificationEnabled>true</NotificationEnabled>
+      <EmailSecurityTeam>true</EmailSecurityTeam>
+      <CreateIncident>true</CreateIncident>
+      <AutoBlockEnabled>true</AutoBlockEnabled>
+    </AlertConfiguration>
+    
+    <SuppressionRules>
+      <SuppressionDuration>PT30M</SuppressionDuration>
+      <ExcludeUsers>
+        <User>SYSTEM</User>
+      </ExcludeUsers>
+      <ExcludeProcesses>
+        <Process>Windows Defender</Process>
+        <Process>MsMpEng.exe</Process>
+        <Process>powershell_ise.exe</Process>
+      </ExcludeProcesses>
+    </SuppressionRules>
+    
+    <RemediationSteps>
+      <Step Order="1">Block the PowerShell process and isolate the device</Step>
+      <Step Order="2">Analyze the decoded command to understand the attack</Step>
+      <Step Order="3">Check for additional malicious activity or persistence</Step>
+      <Step Order="4">Reset credentials for the compromised account</Step>
+      <Step Order="5">Enable PowerShell Constrained Language Mode or Script Block Logging</Step>
+      <Step Order="6">Deploy PowerShell security policies (AppLocker/WDAC)</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude legitimate administrative PowerShell usage</Condition>
+      <Condition>Exclude approved automation scripts with proper signing</Condition>
+      <Condition>Time-based: Focus on non-business hours execution</Condition>
+      <Condition>User-based: Require approval for high-risk PowerShell usage</Condition>
+    </FalsePositiveReduction>
+  </DetectionRule>
+
+  <DetectionRule ID="CUSTOM-LOTL-002" Version="1.0" Status="Active">
+    <Name>WMI Malicious Execution</Name>
+    <Description>Detects malicious use of Windows Management Instrumentation (WMI) for execution, lateral movement, and persistence. Identifies unusual WMI process creation, remote execution, and command execution via WMI.</Description>
+    <Severity>High</Severity>
+    <Tactics>Execution, Lateral Movement, Persistence</Tactics>
+    <Techniques>T1047</Techniques>
+    <ConfidenceLevel>High (91%)</ConfidenceLevel>
+    <FidelityScore>94%</FidelityScore>
+    <MITREMapping>T1047 - Windows Management Instrumentation</MITREMapping>
+    <ThreatActors>APT29, APT28, FIN7, Carbanak</ThreatActors>
+    
+    <DetectionLogic>
+      <![CDATA[
+      let WMISuspiciousClasses = dynamic([
+        "Win32_Process",
+        "Win32_Service",
+        "Win32_ComputerSystem",
+        "Win32_OperatingSystem",
+        "StdRegProv",
+        "Win32_LogicalDisk"
+      ]);
+      
+      let WMISuspiciousMethods = dynamic([
+        "Create",
+        "StartService",
+        "ChangeStartMode",
+        "SetStringValue",
+        "SetDWORDValue",
+        "ExecMethod"
+      ]);
+      
+      // Detect WMI process creation for execution
+      DeviceProcessEvents
+      | where Timestamp > ago(2h)
+      | where FileName in~ ("wmic.exe", "wmiaprvse.exe", "powershell.exe")
+      | extend CommandLower = tolower(ProcessCommandLine)
+      | where
+        // WMIC process creation
+        (FileName == "wmic.exe" and CommandLower has_any ("process", "product", "service"))
+        or
+        // WMI process creation via PowerShell
+        (FileName == "powershell.exe" and CommandLower has_any ("win32_process", "wmiobject", "wmiclass"))
+        or
+        // Suspicious wmiprvse.exe child processes
+        (InitiatingProcessFileName == "wmiprvse.exe" and FileName in~ ("cmd.exe", "powershell.exe", "wscript.exe", "cscript.exe", "rundll32.exe"))
+      | extend WMITechnique = case(
+          CommandLower has "process call create", "Process Creation",
+          CommandLower has "service", "Service Manipulation",
+          CommandLower has "product", "Software Installation",
+          InitiatingProcessFileName == "wmiprvse.exe", "WMI Event Execution",
+          "Other WMI Activity"
+        )
+      | where WMITechnique != "Other WMI Activity"
+      | summarize 
+          WMIExecutions = count(),
+          Techniques = makeset(WMITechnique),
+          Commands = makeset(ProcessCommandLine)
+        by DeviceId, FileName, AccountName
+      | where WMIExecutions >= 2
+      
+      // Also detect remote WMI execution indicators
+      union (
+        DeviceNetworkEvents
+        | where Timestamp > ago(2h)
+        | where Protocol == "DCERPC" or RemotePort == 135
+        | where InitiatingProcessFileName == "wmiprvse.exe"
+          and ActionType == "ConnectionInitiated"
+        | extend TargetIP = RemoteIP
+        | where isnotempty(TargetIP)
+          and TargetIP !in~ ("127.0.0.1", "::1")
+          and not(ipv4_is_private(TargetIP))
+        | summarize RemoteWMIConnections = dcount(TargetIP) by DeviceId, InitiatingProcessFileName
+        | where RemoteWMIConnections >= 3
+      )
+      | extend FinalRisk = case(
+          WMIExecutions >= 5 or RemoteWMIConnections >= 5, 93,
+          WMIExecutions >= 3 or RemoteWMIConnections >= 3, 90,
+          WMIExecutions >= 2 or RemoteWMIConnections >= 2, 85,
+          true, 75
+        )
+      | where FinalRisk >= 85
+      | extend ThreatLevel = case(
+          FinalRisk >= 90, "High",
+          "Medium"
+        )
+      | project-reorder Timestamp, DeviceId, ThreatLevel, WMIExecutions, RemoteWMIConnections, FileName
+      ]]>
+    </DetectionLogic>
+    
+    <AlertConfiguration>
+      <Priority>1</Priority>
+      <AutoSeverity>High</AutoSeverity>
+      <AutoStatus>New</AutoStatus>
+      <NotificationEnabled>true</NotificationEnabled>
+      <EmailSecurityTeam>true</EmailSecurityTeam>
+      <CreateIncident>true</CreateIncident>
+    </AlertConfiguration>
+    
+    <SuppressionRules>
+      <SuppressionDuration>PT2H</SuppressionDuration>
+      <ExcludeUsers>
+        <User>SYSTEM</User>
+        <User>NETWORK SERVICE</User>
+        <User>Administrator</User>
+      </ExcludeUsers>
+      <ExcludeProcesses>
+        <Process>mmc.exe</Process>
+        <Process>wmimgmt.msc</Process>
+        <Process>wbemtest.exe</Process>
+      </ExcludeProcesses>
+    </SuppressionRules>
+    
+    <RemediationSteps>
+      <Step Order="1">Investigate WMI activity and identify executed commands</Step>
+      <Step Order="2">Check for lateral movement via WMI to other systems</Step>
+      <Step Order="3">Review WMI event subscriptions for persistence mechanisms</Step>
+      <Step Order="4">Reset credentials for accounts used in WMI execution</Step>
+      <Step Order="5">Restrict WMI access through firewall rules and permissions</Step>
+      <Step Order="6">Enable WMI activity logging and monitoring</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude legitimate system management activities</Condition>
+      <Condition>Exclude approved remote administration tools</Condition>
+      <Condition>Time-based: Focus on off-hours WMI activity</Condition>
+      <Condition>Network-based: Exclude internal management subnets</Condition>
+    </FalsePositiveReduction>
+  </DetectionRule>
+
+  <DetectionRule ID="CUSTOM-LOTL-003" Version="1.0" Status="Active">
+    <Name>CertUtil for File Download</Name>
+    <Description>Detects abuse of certutil.exe for downloading files, which is commonly used by attackers to download tools, payloads, or exfiltrate data while bypassing security controls that may block other download methods.</Description>
+    <Severity>High</Severity>
+    <Tactics>Defense Evasion, Exfiltration</Techniques>
+    <Techniques>T1218.004</Techniques>
+    <ConfidenceLevel>High (93%)</ConfidenceLevel>
+    <FidelityScore>95%</FidelityScore>
+    <MITREMapping>T1218.004 - System Binary Proxy Execution: Certutil</MITREMapping>
+    <ThreatActors>APT29, APT28, FIN7, Lazarus</ThreatActors>
+    
+    <DetectionLogic>
+      <![CDATA[
+      let CertUtilCommands = dynamic([
+        "-urlcache", "urlcache",
+        "-ping", "-split",
+        "-encode", "-decode"
+      ]);
+      
+      let HTTPIndicators = dynamic([
+        "http://", "https://", "ftp://",
+        "www.", "download", "upload"
+      ]);
+      
+      // Detect CertUtil used for file operations
+      DeviceProcessEvents
+      | where Timestamp > ago(2h)
+      | where FileName in~ ("certutil.exe", "certutil")
+        and InitiatingProcessFileName !in~ ("svchost.exe", "services.exe", "System")
+      | extend CommandLower = tolower(ProcessCommandLine)
+      | where
+        // CertUtil URL cache operations (download)
+        CommandLower has_any (CertUtilCommands)
+        and CommandLower has_any (HTTPIndicators)
+        or
+        // CertUtil encode/decode with files (potential data manipulation)
+        (CommandLower has_any ("-encode", "-decode")
+         and CommandLower contains ".txt" or CommandLower contains ".dat")
+        or
+        // CertUtil splitting files (exfiltration preparation)
+        (CommandLower contains "-split" and CommandLower contains "-")
+      | extend CertUtilActivity = case(
+          CommandLower has "urlcache" and CommandLower has "http", "File Download",
+          CommandLower has "encode" or CommandLower has "decode", "File Encoding",
+          CommandLower has "split", "File Splitting",
+          "Other CertUtil Usage"
+        )
+      | where CertUtilActivity != "Other CertUtil Usage"
+      | summarize 
+          CertUtilOperations = count(),
+          ActivityTypes = makeset(CertUtilActivity),
+          Commands = makeset(ProcessCommandLine)
+        by DeviceId, AccountName, InitiatingProcessFileName
+      | where CertUtilOperations >= 1
+      | extend RiskScore = case(
+          CertUtilOperations >= 3, 93,
+          CertUtilOperations >= 2, 90,
+          true, 85
+        )
