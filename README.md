@@ -1,10 +1,10 @@
 # Microsoft Defender XDR Custom Detection Rules
 
-[![Detection Rules](https://img.shields.io/badge/Detection_Rules-30+-critical)](#) [![Fidelity](https://img.shields.io/badge/Fidelity-High-brightgreen)](#) [![Confidence](https://img.shields.io/badge/Confidence-High-success)](#) [![License](https://img.shields.io/badge/License-MIT-blue)](#)
+[![Detection Rules](https://img.shields.io/badge/Detection_Rules-32-critical)](#) [![Fidelity](https://img.shields.io/badge/Fidelity-High-brightgreen)](#) [![Confidence](https://img.shields.io/badge/Confidence-High-success)](#) [![License](https://img.shields.io/badge/License-MIT-blue)](#)
 
 ## Overview
 
-This repository contains **30+ high-fidelity, high-confidence custom detection rules** for Microsoft Defender XDR. These detections target critical and high-priority attack scenarios including ransomware, lateral movement, credential theft, persistence mechanisms, and data exfiltration.
+This repository contains **32+ high-fidelity, high-confidence custom detection rules** for Microsoft Defender XDR. These detections target critical and high-priority attack scenarios including ransomware, lateral movement, credential theft, persistence mechanisms, and data exfiltration.
 
 ## Repository Structure
 
@@ -197,7 +197,7 @@ customDetections
 ```kql
 // Track detection performance
 DeviceAlertEvents
-| where Timestamp > ago(30d)
+| where Timestamp > ago(32d)
 | where AlertTitle contains "CUSTOM"
 | summarize 
     TotalAlerts = count(),
@@ -293,7 +293,7 @@ All rules include version tracking:
 
 | Metric | Target | Notes |
 |--------|--------|-------|
-| False Positive Rate | < 5% | After 30-day tuning period |
+| False Positive Rate | < 5% | After 32-day tuning period |
 | Mean Time to Detect | < 5 minutes | For critical threats |
 | Alert Volume | 50-200/day | For 10,000+ endpoint environment |
 | Coverage | 95%+ | Of MITRE ATT&CK techniques |
@@ -329,6 +329,6 @@ Contributions welcome! Please ensure:
 
 **Version**: 1.0.0  
 **Last Updated**: 2026-04-27  
-**Rules Count**: 30+  
+**Rules Count**: 32+  
 **Coverage**: 8 Attack Tactics  
 **Quality**: High Fidelity, High Confidence  
