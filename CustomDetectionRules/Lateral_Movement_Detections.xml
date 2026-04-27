@@ -396,4 +396,35 @@
       <AutoStatus>New</AutoStatus>
       <NotificationEnabled>true</NotificationEnabled>
       <EmailSecurityTeam>true</EmailSecurityTeam>
-      <CreateIncident>}
+    </AlertConfiguration>
+    
+    <SuppressionRules>
+      <SuppressionDuration>PT1H</SuppressionDuration>
+      <ExcludeUsers>
+        <User>*_svc$</User>
+        <User>deploy_*</User>
+        <User>admin_*</User>
+      </ExcludeUsers>
+      <ExcludeProcesses>
+        <Process>lsass.exe</Process>
+        <Process>services.exe</Process>
+      </ExcludeProcesses>
+    </SuppressionRules>
+    
+    <RemediationSteps>
+      <Step Order="1">Isolate affected devices from network</Step>
+      <Step Order="2">Reset passwords for compromised accounts</Step>
+      <Step Order="3">Investigate source machines for credential dumping</Step>
+      <Step Order="4">Implement LAPS for local admin passwords</Step>
+      <Step Order="5">Enable LSA Protection (RunAsPPL)</Step>
+      <Step Order="6">Disable NTLM where possible, enforce Kerberos</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude legitimate administrative tools</Condition>
+      <Condition>Time-based: Allow during maintenance windows</Condition>
+      <Condition>Service account usage patterns</Condition>
+      <Condition>Domain controller activities</Condition>
+    </FalsePositiveReduction>
+  </DetectionRule>
+</DetectionRules>

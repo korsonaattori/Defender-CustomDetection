@@ -319,4 +319,51 @@
           CertUtilOperations >= 3, 93,
           CertUtilOperations >= 2, 90,
           true, 85
+      | where CertUtilOperations >= 1
+      | extend RiskScore = case(
+          CertUtilOperations >= 3, 93,
+          CertUtilOperations >= 2, 90,
+          true, 85
         )
+      | where RiskScore >= 85
+      | project-reorder Timestamp, DeviceId, CertUtilActivity, RiskScore, CertUtilOperations, AccountName
+      ]]>  
+    </DetectionLogic>
+    
+    <AlertConfiguration>
+      <Priority>2</Priority>
+      <AutoSeverity>High</AutoSeverity>
+      <AutoStatus>New</AutoStatus>
+      <NotificationEnabled>true</NotificationEnabled>
+      <EmailSecurityTeam>true</EmailSecurityTeam>
+      <CreateIncident>false</CreateIncident>
+    </AlertConfiguration>
+    
+    <SuppressionRules>
+      <SuppressionDuration>PT30M</SuppressionDuration>
+      <ExcludeUsers>
+        <User>ITAdministrator*</User>
+        <User>HelpDesk*</User>
+      </ExcludeUsers>
+      <ExcludeProcesses>
+        <Process>certutil.exe</Process>
+      </ExcludeProcesses>
+    </SuppressionRules>
+    
+    <RemediationSteps>
+      <Step Order="1">Investigate CertUtil usage and command parameters</Step>
+      <Step Order="2">Check downloaded files and their origins</Step>
+      <Step Order="3">Scan affected system for additional threats</Step>
+      <Step Order="4">Verify legitimacy of file encoding/decoding operations</Step>
+      <Step Order="5">Review network connections of affected device</Step>
+      <Step Order="6">Hunt for additional compromised systems</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude legitimate administrative use by IT staff</Condition>
+      <Condition>Allow encoding/decoding during maintenance windows</Condition>
+      <Condition>Whitelist known certificate operations</Condition>
+      <Condition>Alert only for file download operations</Condition>
+    </FalsePositiveReduction>
+  </DetectionRule>
+</DetectionRules>

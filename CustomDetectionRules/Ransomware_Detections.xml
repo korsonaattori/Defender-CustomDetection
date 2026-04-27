@@ -352,4 +352,96 @@
   </DetectionRule>
 
   <DetectionRule ID="CUSTOM-RANS-005" Version="1.0" Status="Active">
-    <Name>Ransom Note Creation Dete}
+    <Name>Ransom Note Creation Dete}    <Name>Ransom Note Creation Detection</Name>
+    <Description>Detects creation of ransom notes and related files containing payment demands, typically with extensions like .txt, .html, .hta, or named README, RECOVER, RESTORE. Identifies attacker attempts to communicate payment and recovery instructions.</Description>
+    <Severity>Critical</Severity>
+    <Tactics>Impact</Tactics>
+    <Techniques>T1486</Techniques>
+    <ConfidenceLevel>Critical (99%)</ConfidenceLevel>
+    <FidelityScore>99%</FidelityScore>
+    <MITREMapping>T1486 - Data Encrypted for Impact</MITREMapping>
+    <ThreatActors>Ryuk, Conti, LockBit, BlackCat, Egregor, Ragnar</ThreatActors>
+    
+    <DetectionLogic>
+      <![CDATA[
+      let RansomNoteNames = dynamic([
+        "README", "readme", "RECOVER", "recover", "RESTORE", "restore",
+        "RECOVERY", "recovery", "HELP", "help", "INSTRUCTION", "instruction",
+        "HOW_TO_DECRYPT", "decrypt", "unlock", "DECRYPT", "FILES",
+        "!README", "!RECOVER", "!DECRYPT"
+      ]);
+      
+      let RansomNoteExtensions = dynamic([
+        ".txt", ".html", ".htm", ".hta", ".bmp", ".jpg", ".png"
+      ]);
+      
+      let RansomKeywords = dynamic([
+        "ransom", "payment", "bitcoin", "btc", "cryptocurrency", "decrypt",
+        "encrypted", "restore", "recover", "unlock", "pay", "contact",
+        "tor", "onion", "monero", "xmr", "wallet", "key", "private"
+      ]);
+      
+      DeviceFileEvents
+      | where Timestamp > ago(1h)
+      | where ActionType in~ ("FileCreated", "FileRenamed")
+      | extend Extension = tolower(tostring(split(FileName, '.')[-1]))
+      | extend BaseName = tostring(split(FileName, '.')[0])
+      | where
+        // Match known ransom note names
+        (BaseName in~ (RansomNoteNames) and Extension in~ (RansomNoteExtensions))
+        or
+        // Files with ransom-related keywords in name
+        (FileName has_any (RansomKeywords) and Extension in~ (RansomNoteExtensions))
+        or
+        // Suspicious file creation patterns
+        (Extension in~ (RansomNoteExtensions) 
+         and (FileName has "!" or FileName has "#" or FileName has "_LOCK_")
+         and FileSize < 102400)  // Typical note size < 100KB
+      | where not(FileName has "recovery") and not(FileName has "Recovery")
+      | extend NoteScore = case(
+          BaseName in~ (RansomNoteNames), 99,
+          FileName has_any (RansomKeywords), 95,
+          true, 90
+        )
+      | project-reorder Timestamp, DeviceId, FileName, FolderPath, NoteScore
+      ]]>  
+    </DetectionLogic>
+    
+    <AlertConfiguration>
+      <Priority>1</Priority>
+      <AutoSeverity>Critical</AutoSeverity>
+      <AutoStatus>New</AutoStatus>
+      <NotificationEnabled>true</NotificationEnabled>
+      <EmailSecurityTeam>true</EmailSecurityTeam>
+      <CreateIncident>true</CreateIncident>
+    </AlertConfiguration>
+    
+    <SuppressionRules>
+      <SuppressionDuration>PT1H</SuppressionDuration>
+      <ExcludeUsers>
+        <User>ITAdministrator*</User>
+        <User>SecurityTeam*</User>
+      </ExcludeUsers>
+      <ExcludeProcesses>
+        <Process>explorer.exe</Process>
+        <Process>notepad.exe</Process>
+      </ExcludeProcesses>
+    </SuppressionRules>
+    
+    <RemediationSteps>
+      <Step Order="1">IMMEDIATE: Isolate all affected devices</Step>
+      <Step Order="2">Do NOT pay the ransom - contact authorities</Step>
+      <Step Order="3">Preserve ransom notes for law enforcement</Step>
+      <Step Order="4">Identify full scope of encryption</Step>
+      <Step Order="5">Initiate full incident response protocol</Step>
+      <Step Order="6">Engage law enforcement and cyber insurance</Step>
+    </RemediationSteps>
+    
+    <FalsePositiveReduction>
+      <Condition>Exclude IT team recovery documentation</Condition>
+      <Condition>Allow legitimate security awareness testing</Condition>
+      <Condition>Time-based exclusions for maintenance</Condition>
+      <Condition>Review for penetration test activities</Condition>
+    </FalsePositiveReduction>
+  </DetectionRule>
+</DetectionRules>
